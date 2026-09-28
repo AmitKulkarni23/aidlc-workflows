@@ -124,18 +124,21 @@ the project's policy and current Testing Contract.
 3. **Do not guess or weaken targets.** If the provider or supported syntax
    cannot be determined, leave the code unannotated and surface the uncertainty
    for resolution. Preserve the Testing Contract, coverage scope, and thresholds.
-4. **Verify the effect during Build and Test.** Run the configured coverage
-   command through the project's actual build and test pipeline, then inspect
-   the freshly generated report. Confirm that each justified pragma excludes
-   the intended code; matching the documented syntax alone does not establish
-   that the pipeline honored it.
+4. **Verify when introducing or changing an exclusion.** Run the configured
+   coverage command through the project's actual build and test pipeline as
+   part of the current work, then inspect the freshly generated report. Confirm
+   that each justified pragma excludes the intended code; matching the documented
+   syntax alone does not establish that the pipeline honored it. This obligation
+   does not depend on Build and Test being scheduled. When that stage is present,
+   its coverage verification checks the exclusions again.
 5. **Record evidence and unresolved gaps.** Include the provider, command,
    report location, and exclusion rationale in the test results. If a pragma
    has no effect, investigate the provider configuration and build transforms,
    then correct the mismatch or safely restructure the unreachable code.
-   Report unmet or unverified applicable coverage targets through the existing
-   failure handling. Never lower thresholds or broaden exclusions just to make
-   a gate pass.
+   If the coverage command cannot run, record the exclusion's effect as
+   unverified; do not assume a later stage will verify it. Report unmet or
+   unverified applicable coverage targets through the existing failure handling.
+   Never lower thresholds or broaden exclusions just to make a gate pass.
 
 ## Test Data Strategy
 
