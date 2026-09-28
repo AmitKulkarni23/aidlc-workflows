@@ -68,6 +68,13 @@ When modifying existing codebases (most common scenario):
 
 ## Testing Patterns
 
+### Coverage Exclusions
+
+Before adding coverage-ignore pragmas, read and apply
+[Coverage-Ignore Pragmas](../aidlc-quality-agent/testing-guide.md#coverage-ignore-pragmas).
+Record the selected provider, coverage command, and rationale for each exclusion
+in the test instructions so subsequent verification can check its actual effect.
+
 ### Unit Test Structure
 Follow the Arrange-Act-Assert (AAA) pattern:
 ```
