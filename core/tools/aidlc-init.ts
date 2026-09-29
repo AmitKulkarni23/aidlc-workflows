@@ -7498,7 +7498,7 @@ export async function main(
     return;
   }
   if (argv.includes("--pin") || argv.includes("--unpin")) {
-    emitResult(await configureProjectPin(argv), options);
+    emitResult(await configureProjectPin(argv, { activeWorkflows: activeWorkflowDescriptions }), options);
     return;
   }
   const requestedHarnesses = valuesAfter(argv, "--harness");
