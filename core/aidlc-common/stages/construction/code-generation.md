@@ -280,6 +280,32 @@ fine whenever they ask.
   words from that gate, so the question shows the revised plan. Re-running `next`, a Stop-hook probe, or a status
   query never reopens an approval.
 
+#### When the workspace source cannot be read
+
+If `next` returns an error saying the workspace source cannot be bound, show it
+to the person. The fix is its first remedy: repair the source boundary it names,
+then run `next`. Only when the person themselves types `Override Plan Approval:
+<reason>` in chat (never suggest it), record the break glass: this is the one
+case where you write the approval record yourself. Print the tags (use
+`--stage-level` instead of `--unit` for zero-Unit work):
+
+```bash
+bun {{HARNESS_DIR}}/tools/aidlc-testing-posture.ts fingerprint --unit "<directive.unit>"
+```
+
+Write both tag lines under a `## Plan Approval` heading in
+`<code-generation-record>/code-generation-questions.md`, followed by
+`[Answer]: Approve Plan`. With your file-editing tool (never a shell command),
+write their reason exactly as they typed it, after `Override Plan Approval:`, as
+the only content of `<code-generation-record>/override-reason.txt`. Then record
+the override; the reason travels in that file, never on the command line:
+
+```bash
+bun {{HARNESS_DIR}}/tools/aidlc-log.ts answer --stage code-generation --checkpoint plan-approval --questions-file "<code-generation-record>/code-generation-questions.md" --details "Approve Plan" --override-file "<code-generation-record>/override-reason.txt" --unit "<directive.unit>"
+```
+
+Then run `next`.
+
 > **Build-and-Test loop-back:** The construction protocol module
 > (`aidlc-common/protocols/stage-protocol-construction.md`) defines this replay.
 > A backward jump opens a new stage attempt, so the prior approval no longer
