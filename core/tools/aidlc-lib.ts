@@ -60,6 +60,7 @@ import {
   isNonAnswer,
   readApprovalGateReply,
   readOptionReply,
+  readStopForNow,
   readTwoChoiceReply,
   replyFollowUp,
   stripRecommendedDecorator,
@@ -6637,6 +6638,7 @@ export interface CopilotDirectiveMetadata {
   message?: string;
   part?: number; parts?: number; continueToken?: string;
   resultSha256?: string;
+  workflowContinues?: true;
 }
 
 export interface CopilotCommandClaim {
@@ -6660,7 +6662,7 @@ export type ActiveDirectiveWriteResult =
 
 export type CopilotStopEvidence =
   | { status: "foreign" | "resume" | "contended" }
-  | { status: "directive" | "recovery"; directive?: CopilotDirectiveMetadata;
+  | { status: "directive" | "recovery"; directive?: CopilotDirectiveMetadata; committed?: boolean;
       stateSha256: string; tokenSha256: string; resumeStatus: string; resumeAction: string; ownerSession: string; ownerEpoch: number };
 
 const ACTIVE_DIRECTIVE_MAX_BYTES = 64 * 1024;
@@ -9370,8 +9372,11 @@ export function settleCopilotCommand(
         result: "settled" as const,
       };
     }
+    // A report `done` that says the workflow continues is not a stopping point:
+    // its next step is a fresh `next`, as the shared Stop probe finds (#1411).
     const canDeliver = (input.commandKind === "next" || input.commandKind === "continue") && !stateChanged && retainedKind ||
-      input.commandKind === "park" || input.commandKind === "report" && (directive.kind === "done" || directive.kind === "parked");
+      input.commandKind === "park" || input.commandKind === "report" &&
+        (directive.kind === "done" && directive.workflowContinues !== true || directive.kind === "parked");
     let resume = base.resume;
     const canSelectResume = input.commandKind === "report" && attempt.resume_action !== undefined &&
       marker.resume?.status === "waiting" && attempt.resume_gate_revision === marker.revision &&
@@ -9495,6 +9500,10 @@ export function copilotStopEvidence(
             ...(marker.parts ? { parts: marker.parts } : {}),
             ...(marker.continue_token ? { continueToken: marker.continue_token } : {}),
           } as CopilotDirectiveMetadata } : {}),
+          // The report `done` settleCopilotCommand held back: the workflow moved
+          // on, so a fresh `next` is the expected next step, not stale evidence.
+          ...(status === "recovery" && marker.kind === "done" && marker.active_attempt?.command_kind === "report" &&
+            marker.active_attempt.status === "settled" ? { committed: true } : {}),
           stateSha256: marker.state_sha256,
           tokenSha256: marker.continue_token_sha256 ?? "",
           resumeStatus: marker.resume?.status ?? "none",
@@ -9877,6 +9886,8 @@ export interface StageGateReply {
   feedback: string | null;
   // What the conductor does when the reply did not approve.
   followUp: string;
+  // The approval also asked to stop the workflow there for now (#1411).
+  stopForNow: boolean;
 }
 
 // A plain yes answers a held gate only when no other recorded question for
@@ -9896,7 +9907,14 @@ export function readStageGateReply(
   reply: string | undefined,
   gate: { acceptAsIs: boolean; bound: boolean; unit?: string },
 ): StageGateReply {
-  const read = readApprovalGateReply(reply ?? "", { acceptAsIs: gate.acceptAsIs, bound: gate.bound });
+  // "Approve, but let's stop there for today": the approval, and a stop. An
+  // approval and a change said with the stop still asks once which they meant.
+  const stop = readStopForNow(reply ?? "");
+  const stopped = stop.stops ? readApprovalGateReply(stop.rest, { acceptAsIs: gate.acceptAsIs, bound: gate.bound }) : null;
+  const stopForNow = stopped?.reading === "approve";
+  const read = stopped && (stopForNow || stopped.reading === "mixed")
+    ? stopped
+    : readApprovalGateReply(reply ?? "", { acceptAsIs: gate.acceptAsIs, bound: gate.bound });
   const approval = read.choice === "Request Changes" ? null : read.choice;
   const report = `${aidlcToolInvocation("orchestrate")} report --stage ${shellArg(stage)}` +
     (gate.unit ? ` --unit ${shellArg(gate.unit)}` : "") + ' --result rejected --user-input "Request Changes"';
@@ -9915,10 +9933,12 @@ export function readStageGateReply(
       : "They chose Request Changes without saying what should change, so nothing was recorded. Ask " +
         `"What should change?", end the turn, then run ${report} --reason "<their answer>".`;
   } else if (approval === null) {
-    const reading = read.reading === "confirm" || read.reading === "question" ? read.reading : "unclear";
+    const reading = read.reading === "confirm" || read.reading === "question" || read.reading === "mixed"
+      ? read.reading
+      : "unclear";
     followUp = replyFollowUp(reading, choices);
   }
-  return { approval, reading: read.reading, feedback: read.feedback, followUp };
+  return { approval, reading: read.reading, feedback: read.feedback, followUp, stopForNow };
 }
 
 // HUMAN_TURN proves only that a prompt-submit seam fired after the previous

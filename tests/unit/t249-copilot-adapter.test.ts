@@ -64,6 +64,7 @@ import {
   DEFAULT_SPACE,
   intentsDirOf,
   seededAuditDir,
+  seedBoltDag,
   seededRecordDir,
   seededStateFile,
 } from "../harness/fixtures.ts";
@@ -2125,6 +2126,184 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
         active_attempt: { id: newerAttempt, status: "settled" },
       });
     }
+  });
+
+  test("21l: approving a stage mid-workflow keeps the loop going; the final approval and Request Changes still end the turn", () => {
+    // #1411: Stop read the approval report's `done` as the end of the whole
+    // workflow, so after "Approve" the chat stopped until the person nudged it.
+    const stop = (dir: string, session: string, active = false) =>
+      runAdapter(dir, "continue-workflow", { ...FIXTURES.stop, cwd: dir, session_id: session, stop_hook_active: active }).stdout;
+    const reply = (dir: string, session: string, prompt: string) =>
+      runAdapter(dir, "record-human-turn", { ...FIXTURES.userPromptSubmit, cwd: dir, session_id: session, prompt });
+    const atGate = (fixture: string, session: string) => {
+      const dir = orchestrationProject();
+      writeFileSync(
+        seededStateFile(dir),
+        readFileSync(join(REPO_ROOT, "tests", "fixtures", fixture), "utf-8")
+          .replace(/^- \*\*Change Control\*\*:.*$/m, "$&\n- **Summary Confirmation**: off (set by you)"),
+      );
+      const routed = driveToRunStage(dir, session);
+      const stage = String(routed.directive.stage);
+      for (const path of (routed.directive.produces as string[]).filter((p) => !p.endsWith("-questions.md"))) {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), "# Artifact\n\nContent.\n");
+      }
+      const opened = runLifecycle(dir, session, "source", ["report", "--stage", stage, "--result", "awaiting-approval"], `${session}-gate`);
+      expect(opened.directive.kind, JSON.stringify(opened.directive)).toBe("print");
+      // Waiting on the person at the gate ends the turn, as before.
+      expect(stop(dir, session)).toBe("");
+      return { dir, stage };
+    };
+
+    const mid = atGate("state-operation.md", "approve-owner");
+    expect(mid.stage).toBe("deployment-pipeline");
+    reply(mid.dir, "approve-owner", "Approve");
+    const approved = runLifecycle(
+      mid.dir, "approve-owner", "source",
+      ["report", "--stage", mid.stage, "--result", "approved", "--user-input", "Approve"], "approve-result",
+    );
+    expect(approved.directive.kind, JSON.stringify(approved.directive)).toBe("done");
+    // The conductor goes straight to `next`; Stop's nudge is the fallback.
+    expect(approved.directive.workflow_continues).toBe(true);
+    const nudged = JSON.parse(stop(mid.dir, "approve-owner")) as { decision?: string; reason?: string };
+    expect(nudged.decision).toBe("block");
+    expect(nudged.reason).toContain('The result for "deployment-pipeline" is recorded');
+    expect(nudged.reason).toContain("engine orchestrate next");
+    expect(nudged.reason).toContain('"environment-provisioning"');
+    expect(nudged.reason).not.toContain("missing or stale");
+    expect(nudged.reason).not.toContain("do not reuse an earlier receipt");
+    // A person who asked to stop there is not pushed into the next stage.
+    expect(nudged.reason).toContain("If the person asked to stop here, run `");
+    expect(nudged.reason).toContain("engine orchestrate park` instead.");
+    // One nudge only: a second Stop with no progress lets the turn end.
+    expect(stop(mid.dir, "approve-owner", true)).toBe("");
+    const next = runLifecycle(mid.dir, "approve-owner", "source", ["next"], "approve-next");
+    expect(next.directive).toMatchObject({ kind: "run-stage", stage: "environment-provisioning" });
+    const working = JSON.parse(stop(mid.dir, "approve-owner")) as { decision?: string; reason?: string };
+    expect(working.decision).toBe("block");
+    expect(working.reason).toContain("exact delivered AIDLC run-stage");
+
+    // "Approve, and let's stop there": after the approval the conductor parks.
+    const pause = atGate("state-operation.md", "pause-owner");
+    reply(pause.dir, "pause-owner", "Approve");
+    const recorded = runLifecycle(
+      pause.dir, "pause-owner", "source",
+      ["report", "--stage", pause.stage, "--result", "approved", "--user-input", "Approve"], "pause-result",
+    );
+    expect(recorded.directive).toMatchObject({ kind: "done", workflow_continues: true });
+    const parked = runLifecycle(pause.dir, "pause-owner", "direct", ["park"], "pause-park");
+    expect(parked.directive).toMatchObject({ kind: "parked", stage: "environment-provisioning" });
+    expect(stop(pause.dir, "pause-owner")).toBe("");
+
+    // Said in one reply, the engine approves and parks: no extra question.
+    const both = atGate("state-operation.md", "both-owner");
+    const words = "Approve, but let's stop there for today";
+    reply(both.dir, "both-owner", words);
+    const parkedAtOnce = runLifecycle(
+      both.dir, "both-owner", "source",
+      ["report", "--stage", both.stage, "--result", "approved", "--user-input", words], "both-result",
+    );
+    expect(parkedAtOnce.directive, JSON.stringify(parkedAtOnce.directive))
+      .toMatchObject({ kind: "parked", stage: "environment-provisioning" });
+    expect(stop(both.dir, "both-owner")).toBe("");
+
+    const final = atGate("state-final-stage.md", "final-owner");
+    expect(final.stage).toBe("feedback-optimization");
+    reply(final.dir, "final-owner", "Approve");
+    const completed = runLifecycle(
+      final.dir, "final-owner", "source",
+      ["report", "--stage", final.stage, "--result", "approved", "--user-input", "Approve"], "final-result",
+    );
+    expect(completed.directive.kind, JSON.stringify(completed.directive)).toBe("done");
+    expect(completed.directive).not.toHaveProperty("workflow_continues");
+    expect(readFileSync(seededStateFile(final.dir), "utf-8")).toContain("- **Status**: Completed");
+    expect(marker(final.dir)).toMatchObject({ kind: "done", delivery: "delivered" });
+    expect(stop(final.dir, "final-owner")).toBe("");
+
+    const changes = atGate("state-operation.md", "changes-owner");
+    reply(changes.dir, "changes-owner", "Request changes");
+    const rejected = runLifecycle(
+      changes.dir, "changes-owner", "source",
+      [
+        "report", "--stage", changes.stage, "--result", "rejected",
+        "--user-input", "Request Changes", "--reason", "add a canary step",
+      ],
+      "changes-result",
+    );
+    expect(rejected.directive.kind, JSON.stringify(rejected.directive)).toBe("print");
+    expect(stop(changes.dir, "changes-owner")).toBe("");
+
+    // An isolated single-stage run's `done` still ends the turn.
+    const single = orchestrationProject();
+    driveToRunStage(single, "single-owner");
+    const spec = commandSpec(single, "source", ["report", "--single", "--stage", "incident-response", "--result", "completed"]);
+    const rewritten = rewrittenCommand(runAdapter(single, "guard-tool-call", commandPayload(single, "single-owner", spec.text, "single-result")));
+    runAdapter(single, "post-tool", commandPayload(
+      single, "single-owner", rewritten, "single-result", true,
+      '{"kind":"done","reason":"Single-stage run of \\"incident-response\\" committed."}',
+    ));
+    expect(marker(single)).toMatchObject({ kind: "done", delivery: "delivered" });
+    expect(stop(single, "single-owner")).toBe("");
+  });
+
+  test("21m: a Unit's skip in a unit-major walk keeps the loop going without naming the wrong stage", () => {
+    // Current Stage stays on the block's first stage while the walk moves
+    // through (stage, Unit) beats, so the fallback nudge must not name it as
+    // the next step (#1411).
+    const dir = orchestrationProject();
+    const session = "unit-major-owner";
+    // The state format's separator is an em dash; spelled as an escape here.
+    const row = (mark: string, slug: string) => `- [${mark}] ${slug} \u2014 EXECUTE`;
+    writeFileSync(seededStateFile(dir), [
+      "# AI-DLC State Tracking", "",
+      "## Project Information", "- **Project**: unit-major walk", "- **Project Type**: Greenfield",
+      "- **Scope**: feature", "- **State Version**: 8", "- **Skeleton Stance**: on", "",
+      "## Runtime State", "- **Revision Count**: 0", "- **Construction Iteration**: unit-major",
+      "- **Summary Confirmation**: off (set by you)", "",
+      "## Scope Configuration", "- **Stages to Execute**: all", "- **Stages to Skip**: none",
+      "- **Depth**: Standard", "- **Test Strategy**: Standard", "",
+      "## Stage Progress", "", "### CONSTRUCTION PHASE", row("-", "functional-design"),
+      ...["nfr-requirements", "nfr-design", "infrastructure-design", "code-generation", "build-and-test"].map((slug) => row(" ", slug)),
+      "",
+      "## Current Status", "- **Lifecycle Phase**: CONSTRUCTION", "- **Current Stage**: functional-design",
+      "- **Status**: Running", "",
+    ].join("\n"));
+    seedBoltDag(dir, ["alpha", "beta"]);
+    let attempt = 0;
+    const step = (args: string[]) => {
+      let directive = runLifecycle(dir, session, attempt % 2 ? "direct" : "source", args, `${session}-${attempt++}`).directive;
+      while (directive.kind === "load-steering") {
+        directive = runLifecycle(dir, session, "source", ["continue", String(directive.receipt)], `${session}-${attempt++}`).directive;
+      }
+      return directive;
+    };
+    // Walk alpha through the design steps before infrastructure design.
+    let directive = step(["next"]);
+    for (let beat = 0; directive.stage !== "infrastructure-design"; beat++) {
+      expect(directive, JSON.stringify(directive)).toMatchObject({ kind: "run-stage", unit: "alpha" });
+      if (beat > 5) throw new Error("the walk did not reach infrastructure-design");
+      for (const path of (directive.produces as string[]).filter((p) => !p.endsWith("-questions.md"))) {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), "# Artifact\n\nContent.\n");
+      }
+      directive = step(["next"]);
+    }
+    expect(directive).toMatchObject({ kind: "run-stage", unit: "alpha" });
+    const skipped = step([
+      "report", "--stage", "infrastructure-design", "--unit", "alpha", "--result", "skipped",
+      "--reason", "No infrastructure to design for this unit",
+    ]);
+    expect(skipped, JSON.stringify(skipped)).toMatchObject({ kind: "done", workflow_continues: true });
+    expect(readFileSync(seededStateFile(dir), "utf-8")).toContain("- **Current Stage**: functional-design");
+    const nudged = JSON.parse(
+      runAdapter(dir, "continue-workflow", { ...FIXTURES.stop, cwd: dir, session_id: session }).stdout,
+    ) as { decision?: string; reason?: string };
+    expect(nudged.decision).toBe("block");
+    expect(nudged.reason).toContain('The result for "infrastructure-design" is recorded');
+    expect(nudged.reason).toContain("engine orchestrate next");
+    expect(nudged.reason).not.toContain('"functional-design"');
+    expect(nudged.reason).not.toContain("missing or stale");
+    expect(step(["next"])).toMatchObject({ kind: "run-stage", stage: "code-generation", unit: "alpha" });
   });
 
   test("22: Post settles only its active attempt across duplicate, reorder, compaction, and malformed result", () => {

@@ -74,6 +74,7 @@ const BUN = process.execPath;
 const ORCHESTRATE = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
 const DISPATCHER = join(AIDLC_SRC, "tools", "aidlc.ts");
 const GUARD = join(AIDLC_SRC, "hooks", "aidlc-plan-approval-guard.ts");
+const STATE = join(AIDLC_SRC, "tools", "aidlc-state.ts");
 const SESSION = "01995000-7a11-7000-8000-000000000001";
 const OTHER_SESSION = "01995000-7a11-7000-8000-000000000002";
 
@@ -270,6 +271,64 @@ describe("the engine asks for Plan Approval", () => {
     expect(build.plan_approval).toEqual({ status: "approved" });
   });
 
+  // An approval and a request to stop the workflow for now is exactly that:
+  // the plan is approved and the workflow parks, with no extra question (#1411).
+  test.each([
+    "Approve the plan, but let's stop there for today", "Approved. Stop here for today.", "lgtm, done for today",
+  ])("%s approves the plan and parks the workflow", (text) => {
+    const proj = project();
+    askFor(proj);
+    const said = reply(proj, text);
+    expect(said).toContain('recorded \\"Approve Plan\\"');
+    expect(said).toContain("parked");
+    expect(auditText(proj)).toContain("**Event**: PLAN_APPROVAL_RECORDED");
+    expect(auditText(proj)).toContain("**Event**: WORKFLOW_PARKED");
+    expect(next(proj).kind).toBe("parked");
+    // Resuming later builds the approved plan.
+    const unpark = spawnSync(BUN, [STATE, "unpark", "--project-dir", proj], { encoding: "utf-8" });
+    expect(unpark.status, unpark.stderr).toBe(0);
+    const build = next(proj);
+    expect(build.kind).toBe("run-stage");
+    expect(build.plan_approval).toEqual({ status: "approved" });
+  });
+
+  // Under autonomous Construction the person's stop still wins: nothing starts
+  // building until they resume (#1411). t121 pins that Stop ends the turn.
+  test("an approval that asks to stop parks an autonomous run too", () => {
+    const proj = project();
+    const file = seededStateFile(proj);
+    writeFileSync(file, readFileSync(file, "utf-8").replace(
+      "## Current Status", "## Current Status\n- **Construction Autonomy Mode**: autonomous",
+    ), "utf-8");
+    askFor(proj);
+    const said = reply(proj, "Approve the plan, but let's stop there for today");
+    expect(said).toContain('recorded \\"Approve Plan\\"');
+    expect(said).toContain("so it is parked");
+    expect(readFileSync(file, "utf-8")).toMatch(/^- \*\*Parked By\*\*: person$/m);
+    expect(next(proj).kind).toBe("parked");
+    // Resuming clears the person's park; the CLI still refuses to park the run.
+    const unpark = spawnSync(BUN, [STATE, "unpark", "--project-dir", proj], { encoding: "utf-8" });
+    expect(unpark.status, unpark.stderr).toBe(0);
+    expect(readFileSync(file, "utf-8")).not.toContain("Parked By");
+    const selfPark = spawnSync(BUN, [STATE, "park", "--project-dir", proj], { encoding: "utf-8" });
+    expect(selfPark.status).not.toBe(0);
+    expect(next(proj).kind).toBe("run-stage");
+  });
+
+  test.each([
+    "approve, but rename slugify to toSlug",
+    "approve, but rename slugify to toSlug, and let's stop for today",
+  ])("an approval mixed with a change records nothing and asks once: %s", (text) => {
+    const proj = project();
+    askFor(proj);
+    const said = reply(proj, text);
+    expect(said).toContain("nothing was recorded");
+    expect(said).toContain("make the change first");
+    expect(auditText(proj)).not.toContain("**Event**: PLAN_APPROVAL_RECORDED");
+    expect(auditText(proj)).not.toContain("**Event**: WORKFLOW_PARKED");
+    expect(next(proj).ask_type).toBe("plan-approval");
+  });
+
   test("an answer from another chat on the same work counts", () => {
     const proj = project();
     askFor(proj);
@@ -399,6 +458,25 @@ describe("the engine asks for Plan Approval", () => {
     const ask = next(proj);
     expect(ask.kind).toBe("ask");
     expect(ask.question).toBe("I repaired the Testing Contract block. Build your edited plan?");
+  });
+
+  // The person's stop holds even when the plan they approved needs repair
+  // first: the repair waits until they resume (#1411).
+  test("edit mode: approve and stop parks even when the Testing Contract needs repair", () => {
+    const proj = project();
+    askFor(proj);
+    reply(proj, "I'll edit the files");
+    const planPath = join(stageDir(proj), "code-generation-plan.md");
+    writeFileSync(planPath, readFileSync(planPath, "utf-8").replace('"version": 1', '"version": 1,,'), "utf-8");
+    const said = reply(proj, "done, and let's stop for today");
+    expect(said).toContain("broke the Testing Contract block");
+    expect(said).toContain("so it is parked");
+    expect(next(proj).kind).toBe("parked");
+    const unpark = spawnSync(BUN, [STATE, "unpark", "--project-dir", proj], { encoding: "utf-8" });
+    expect(unpark.status, unpark.stderr).toBe(0);
+    const repair = next(proj);
+    expect(repair.kind).toBe("run-stage");
+    expect(repair.plan_approval.status).toBe("repair");
   });
 
   test("after approval, code that moved elsewhere gives no new question even under strict", () => {

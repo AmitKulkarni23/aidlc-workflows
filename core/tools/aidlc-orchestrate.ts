@@ -371,6 +371,7 @@ import {
   type GuardPreflightAction,
   type GuardPreflightResult,
   guardPreflight as stateGuardPreflight,
+  parkWorkflow,
 } from "./aidlc-state.ts";
 import { inspectStageValidity } from "./aidlc-validity.ts";
 import { VALID_DEPTHS, VALID_TEST_STRATEGIES } from "./aidlc-guard-switch.ts";
@@ -2049,16 +2050,83 @@ function staleStateVersionError(stateContent: string): string | null {
 // parked - the terminal directive a parked workflow emits (issue #367). Carries
 // the slug it parked at; the Stop hook treats `parked` as a terminal allow so
 // the conductor can end its turn at a clean inter-stage boundary.
-function parkedDirective(reason: string, stage: string): ParkedDirective {
+function parkedDirective(
+  reason: string,
+  stage: string,
+  narration = "Pausing here with everything saved. Run `/aidlc --resume` when you want to pick it back up.",
+): ParkedDirective {
   return {
     kind: "parked",
     reason,
     stage,
     // Parking is the one stop that a user could mistake for a crash, so the
     // spoken line says the work is safe and names the way back in.
-    narration:
-      "Pausing here with everything saved. Run `/aidlc --resume` when you want to pick it back up.",
+    narration,
   };
+}
+
+// The `parked` a workflow answers with, naming where it resumes. Under the
+// unit-major walk Current Stage stays on the block's first stage, so name the
+// live (stage, Unit) beat instead (#1411).
+function workflowParkedDirective(
+  pd: string,
+  stateContent: string,
+  parkedAt: string,
+): ParkedDirective {
+  const scope = getField(stateContent, "Scope")?.trim() ?? "";
+  const beat = scope ? unitMajorWorkBeat(pd, scope, stateContent, parkedAt) : null;
+  return beat
+    ? parkedDirective(
+        `Workflow parked at "${beat.stage.slug}" for unit "${beat.unit}". Resume with /aidlc --resume.`,
+        beat.stage.slug,
+      )
+    : parkedDirective(
+        `Workflow parked at "${parkedAt}". Resume with /aidlc --resume.`,
+        parkedAt,
+      );
+}
+
+// The `parked` a successful park answers with. A team Unit checkout parks
+// only its Unit, locally, so it names the Unit.
+function parkedAfterPark(pd: string, parkStdout: string): ParkedDirective {
+  const stateContent = loadStateFileIfPresent(pd);
+  let parkedUnit: string | undefined;
+  try {
+    const result = JSON.parse(parkStdout.trim()) as { unit?: unknown; checkout_local?: unknown };
+    if (result.checkout_local === true && typeof result.unit === "string") parkedUnit = result.unit;
+  } catch { /* the workflow park result carries no Unit */ }
+  if (parkedUnit !== undefined) {
+    return parkedDirective(
+      `Unit "${parkedUnit}" is parked in this checkout. Resume with /aidlc --resume.`,
+      (stateContent ? getField(stateContent, "Current Stage") : null) ?? "functional-design",
+    );
+  }
+  const parkedAt = stateContent ? (getField(stateContent, "Parked At Stage") ?? "").trim() : "";
+  return stateContent
+    ? workflowParkedDirective(pd, stateContent, parkedAt)
+    : parkedDirective(`Workflow parked at "${parkedAt}". Resume with /aidlc --resume.`, parkedAt);
+}
+
+// "Approve, but let's stop there for today": the approval is recorded, then
+// the engine parks the workflow, so the person is not asked again and the
+// next stage does not start (#1411). `attended` when a person answered the
+// gate: their stop then parks an autonomous run too. In-process, because only
+// this caller has read the reply. Null when the park is refused (a gate the
+// autonomous grant answered never parks): the caller answers as it would
+// without it.
+function parkAfterApproval(pd: string, slug: string, attended: boolean, unit?: string): ParkedDirective | null {
+  let result: string;
+  try {
+    result = JSON.stringify(parkWorkflow(pd, { attended }));
+  } catch {
+    return null;
+  }
+  const parked = parkedAfterPark(pd, result);
+  return parkedDirective(
+    `Approved "${slug}"${unit ? ` for unit "${unit}"` : ""}. ${parked.reason}`,
+    parked.stage,
+    "Approved, and paused here with everything saved. Run `/aidlc --resume` when you want to pick it back up.",
+  );
 }
 
 // Workspace detection can serve several scope examples in one routing answer;
@@ -5284,10 +5352,7 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     const parkedAt = (getField(stateContent, "Parked At Stage") ?? "").trim();
     const currentSlug = (getField(stateContent, "Current Stage") ?? "").trim();
     if (parkedAt.length > 0 && parkedAt === currentSlug) {
-      emit(parkedDirective(
-        `Workflow parked at "${parkedAt}". Resume with /aidlc --resume.`,
-        parkedAt,
-      ));
+      emit(workflowParkedDirective(pd, stateContent, parkedAt));
       return;
     }
   }
@@ -9892,6 +9957,17 @@ function handleResumeReport(
   ));
 }
 
+// A report `done` that left the workflow running says so, read from the state
+// the report just wrote: the conductor runs `next` at once instead of telling
+// the person the work is complete (#1411). The workflow-complete `done` and an
+// isolated `--single` run's `done` carry nothing.
+function workflowContinues(pd: string): { workflow_continues?: true } {
+  const after = loadStateFileIfPresent(pd);
+  return after !== null && getField(after, "Status")?.trim() !== "Completed"
+    ? { workflow_continues: true }
+    : {};
+}
+
 // The `report` handler. Reads the acted stage + scope from state, decides the
 // committing subcommand(s) (gate status, then finality), shells out to the
 // atomic state tool, and emits a terminal `done` directive on success or an
@@ -10126,6 +10202,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
             "whole step is marked skipped. Run next to continue."
           : `Skipped "${slug}" for unit "${beat.unit}" only; the other units still do this ` +
             "step. Run next to continue.",
+        ...workflowContinues(pd),
       });
       return;
     }
@@ -10198,6 +10275,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
       reason:
         `Committed skip for "${slug}" (scope: ${scope}). ` +
         "State routed forward; run next to continue.",
+      ...workflowContinues(pd),
     });
     return;
   }
@@ -10328,6 +10406,16 @@ function handleReport(args: string[], projectDir: string | undefined): void {
         changeNotices.push(...changeNoticesFromToolOutput(res.stdout));
         personsFeedback ??= personsFeedbackFromToolOutput(res.stdout);
       }
+      // A Unit approval that also asked to stop for now parks (#1411).
+      const parked = flags.result === "approved" &&
+          readStageGateReply(slug, flags.userInput, { acceptAsIs: false, bound: true, unit }).stopForNow &&
+          workflowContinues(pd).workflow_continues
+        ? parkAfterApproval(pd, slug, !isAutonomousConstructionGate(stateContent, node, pd), unit)
+        : null;
+      if (parked) {
+        emit(withChangeNotices(parked, changeNotices));
+        return;
+      }
       emit(
         withChangeNotices(
           flags.result === "approved"
@@ -10336,6 +10424,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
                 reason:
                   `Committed ${committed.join(" + ")} for unit "${unit}" of "${slug}". ` +
                   "Run next to continue the unit-major walk.",
+                ...workflowContinues(pd),
               }
             : printDirective(
                 `Recorded ${flags.result} for unit "${unit}" of "${slug}".` +
@@ -10418,6 +10507,11 @@ function handleReport(args: string[], projectDir: string | undefined): void {
       return;
     }
   }
+  // "Approve, but let's stop there for today" parks once the approval is
+  // recorded, with or without the human-presence guard: the stop is the
+  // person's own request (#1411).
+  const stopForNow = isGated && flags.result === "approved" &&
+    readStageGateReply(slug, flags.userInput, { acceptAsIs: true, bound: true }).stopForNow;
 
   // Gate lifecycle reports keep every model-issued state transition behind the
   // engine boundary. They resolve before artifact/ensemble completion guards:
@@ -10654,6 +10748,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
           reason:
             `Stage "${slug}" is already completed and the workflow has moved on to ` +
             `"${currentSlug}" (scope: ${scope}); idempotent re-report, no transition needed.`,
+          ...workflowContinues(pd),
         });
         return;
       }
@@ -10733,7 +10828,14 @@ function handleReport(args: string[], projectDir: string | undefined): void {
 
   // The transition committed. Emit a terminal `done` directive naming the move
   // — the loop driver reads this to know the report landed and the next `next`
-  // will see fresh state.
+  // will see fresh state. An approval that also asked to stop for now parks.
+  const parked = stopForNow && workflowContinues(pd).workflow_continues
+    ? parkAfterApproval(pd, slug, !isAutonomousConstructionGate(stateContent, node, pd))
+    : null;
+  if (parked) {
+    emit(withChangeNotices(parked, changeNotices));
+    return;
+  }
   emit(
     withChangeNotices(
       {
@@ -10741,6 +10843,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
         reason:
           `Committed ${committed.join(" + ")} for "${slug}" (scope: ${scope}). ` +
           "State advanced; run next to continue.",
+        ...workflowContinues(pd),
       },
       changeNotices,
     ),
@@ -10767,14 +10870,7 @@ function handlePark(_args: string[], projectDir: string | undefined): void {
     emit(errorDirective(`Cannot park the workflow${detail ? `: ${detail}` : "."}`));
     return;
   }
-  const stateContent = loadStateFileIfPresent(pd);
-  const parkedAt = stateContent
-    ? (getField(stateContent, "Parked At Stage") ?? "").trim()
-    : "";
-  emit(parkedDirective(
-    `Workflow parked at "${parkedAt}". Resume with /aidlc --resume.`,
-    parkedAt,
-  ));
+  emit(parkedAfterPark(pd, res.stdout));
 }
 
 function handleTeamBoard(
