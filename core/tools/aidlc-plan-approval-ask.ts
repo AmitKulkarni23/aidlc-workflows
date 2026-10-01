@@ -38,6 +38,8 @@ import {
   removePlanApprovalRuntimeRecord,
   stalePlanApprovalReceiptsForTarget,
   stateFilePath,
+  steeringPayloadAuthenticAt,
+  steeringTokenKeyPathFor,
   toPosix,
   visibleMarkdownLines,
   withActiveDirectiveLock,
@@ -762,20 +764,22 @@ function planApprovalOffNotice(projectDir: string, units: Array<string | null>, 
 /**
  * Called after a build directive routed with plan approval off is published:
  * record, for each target that has no approval yet, that its plan was built
- * without asking. Idempotent for the same files.
+ * without asking. Idempotent for the same files. True when every target may
+ * now build; false when nothing could be recorded for one (plan approval was
+ * turned back on, or its plan or the workspace could not be read).
  */
 export function publishPlanApprovalSkip(
   projectDir: string,
   directive: RunStageDirective | InvokeSwarmDirective,
-): void {
+): boolean {
   const units: Array<string | null> = directive.kind === "run-stage" ? [directive.unit ?? null] : directive.units;
   const setting = planApprovalSettingFor(projectDir);
-  if (setting?.value !== "off") return;
-  withAuditLock(projectDir, () => {
+  return withAuditLock(projectDir, () => {
     for (const unit of units) {
-      if (codeGenerationExecutionAllowed(projectDir, { unit })) continue;
+      if (setting?.value !== "off" || codeGenerationExecutionAllowed(projectDir, { unit })) continue;
       recordPlanApprovalSkipped(projectDir, unit, setting);
     }
+    return units.every((unit) => codeGenerationExecutionAllowed(projectDir, { unit }));
   });
 }
 
@@ -1305,6 +1309,40 @@ const REVIEW_REQUEST_RE =
   /\b(?:review|re-?review|re-?approve|look (?:at|over)|see|show me|check|reopen)\b[^.?!]{0,40}\b(?:the |my |this |that )?(?:code )?plan\b/i;
 
 /**
+ * A rules part's route, read only when it is the payload its receipt was
+ * minted for: the marker is a file in the workspace. `unit` is the signed Unit
+ * (`p` says the step has one; `u` names it); the marker's own top-level Unit is
+ * not covered by the receipt, so it never decides the target. `built` names
+ * the targets when the part delivers a step after the build (the completion
+ * gate, a Unit or swarm checkpoint, the settled swarm), and is null for a plan
+ * or build step. Null when the payload is missing or edited.
+ */
+function signedPartRoute(
+  projectDir: string,
+  marker: ActiveDirectiveMarker,
+): { unit: string | null; built: Array<string | null> | null } | null {
+  const payload = marker.steering_payload;
+  if (!payload) return null;
+  const receipt = marker.steering_payload_receipt;
+  const keyPath = steeringTokenKeyPathFor(projectDir, stateFilePath(projectDir));
+  if (typeof receipt !== "string" || !steeringPayloadAuthenticAt(keyPath, payload, receipt)) return null;
+  const unit = payload.p === true && typeof payload.u === "string" ? payload.u : null;
+  const batch = payload.y as { units?: unknown } | undefined;
+  if (payload.o !== true && payload.z !== true && payload.j === undefined && batch === undefined) {
+    return { unit, built: null };
+  }
+  const units = Array.isArray(batch?.units) ? batch.units : [];
+  const named = units.length > 0 && units.every((member) => {
+    try {
+      return typeof member === "string" && codeGenerationTargetId({ unit: member }).length > 0;
+    } catch {
+      return false;
+    }
+  });
+  return { unit, built: named ? units as string[] : [unit] };
+}
+
+/**
  * The person asked to review the plan while code generation may keep
  * building (an approved plan, or a lowered fence). The next `next` asks for
  * approval again before anything else runs. Returns the notice, or null.
@@ -1321,11 +1359,26 @@ export function recordPlanApprovalReviewRequest(projectDir: string, text: string
     }
     const marker = readActiveDirectiveMarker(projectDir, state);
     if (marker?.version !== 2 || marker.stage !== STAGE) return null;
-    if (marker.kind !== "run-stage" && marker.kind !== "invoke-swarm") return null;
-    const units: Array<string | null> = marker.kind === "run-stage"
-      ? [marker.unit ?? null]
+    // A rules part is the run-stage on its way, for the same target.
+    const runStage = marker.kind === "run-stage" || marker.kind === "load-steering";
+    if (!runStage && marker.kind !== "invoke-swarm") return null;
+    const signed = marker.kind === "load-steering" ? signedPartRoute(projectDir, marker) : null;
+    const units: Array<string | null> = runStage
+      ? [signed ? signed.unit : marker.unit ?? null]
       : marker.units ?? [];
     if (units.length === 0) return null;
+    // A part on its way to a step that follows the build cannot show the plan
+    // before anything is built: the code already is. Not every such step has a
+    // person reviewing it (an autonomous checkpoint, the settled swarm), so the
+    // plan is shown now, while the person is asking.
+    const built = signed?.built ?? null;
+    if (built !== null) {
+      const plans = built.map((unit) =>
+        toPosix(relative(projectDir, join(codeGenerationRecordDir(projectDir, unit), PLAN_FILE))));
+      return `AIDLC Plan Approval: the person asked to review the plan for ${labels(built)}. Its code is ` +
+        `already built from it, so show them the plan now (${plans.join(", ")}), then carry on with the ` +
+        "step that is arriving.";
+    }
     const intentId = marker.intent_uuid ?? "bare-space";
     for (const unit of units) {
       requestPlanApprovalReview(projectDir, codeGenerationTargetId({ unit }), intentId);
