@@ -20,9 +20,9 @@
     "render-surface": "tui"
   },
   "counts": {
-    "total": 1260,
+    "total": 1261,
     "enumeratedByClass": {
-      "function": 930,
+      "function": 931,
       "audit": 108,
       "scope": 11,
       "stage": 33,
@@ -31,7 +31,7 @@
       "render-surface": 7
     },
     "coveredByClass": {
-      "function": 572,
+      "function": 573,
       "audit": 68,
       "scope": 11,
       "stage": 11,
@@ -3017,6 +3017,18 @@
     {
       "unitClass": "function",
       "unitId": "function:customPlanBase",
+      "minMechanism": "none",
+      "coveredBy": [
+        {
+          "file": "tests/unit/t351-composer-unsaved-plans.test.ts",
+          "mechanism": "cli"
+        }
+      ],
+      "status": "covered"
+    },
+    {
+      "unitClass": "function",
+      "unitId": "function:customPlanStart",
       "minMechanism": "none",
       "coveredBy": [
         {
