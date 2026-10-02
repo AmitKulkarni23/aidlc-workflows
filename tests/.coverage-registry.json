@@ -20,9 +20,9 @@
     "render-surface": "tui"
   },
   "counts": {
-    "total": 1273,
+    "total": 1274,
     "enumeratedByClass": {
-      "function": 941,
+      "function": 942,
       "audit": 110,
       "scope": 11,
       "stage": 33,
@@ -31,7 +31,7 @@
       "render-surface": 7
     },
     "coveredByClass": {
-      "function": 577,
+      "function": 578,
       "audit": 70,
       "scope": 11,
       "stage": 11,
@@ -4706,6 +4706,18 @@
       "minMechanism": "none",
       "coveredBy": [],
       "status": "UNCOVERED"
+    },
+    {
+      "unitClass": "function",
+      "unitId": "function:installedKiroLayout",
+      "minMechanism": "none",
+      "coveredBy": [
+        {
+          "file": "tests/unit/t230-dispatcher-routes.test.ts",
+          "mechanism": "cli"
+        }
+      ],
+      "status": "covered"
     },
     {
       "unitClass": "function",
