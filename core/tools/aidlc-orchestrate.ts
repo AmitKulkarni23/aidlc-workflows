@@ -91,10 +91,13 @@ import {
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  deleteQuestion,
+  latestFrontQuestionId,
   pruneExpiredQuestions,
   QUESTION_UNAVAILABLE,
   type QuestionTarget,
   questionTargetSelected,
+  readComposeEntry,
   readQuestion,
   type StoredQuestion,
   saveQuestion,
@@ -2805,7 +2808,8 @@ function composeDispatchDirective(
       );
     } else {
       parts.push(
-        "The proposal MUST include a nonblank `creationDescription` grounded in the approved work. For report-driven composition, derive it from the report's actual findings; for a task-less front composition, derive it from the approved proposal. Never approve a proposal that would continue into a scope-only creation.",
+        "The proposal MUST include a nonblank `creationDescription` grounded in the approved work. For report-driven composition, derive it from the report's actual findings; for a task-less front composition, derive it from the approved proposal. Never approve a proposal that would continue into a scope-only creation. " +
+          `On approval, run \`next --scope <scopeName> --request ${flags.request} -- <creationDescription>\` (a custom plan names its baseScope instead and adds its typed changes, below), with the description as one shell-safe argument: the request id ties this work to its gate, and it works once.`,
       );
     }
     // Levels typed with the request ride on to creation: a typed depth
@@ -2842,7 +2846,7 @@ function composeDispatchDirective(
   );
   if (!inFlight) {
     parts.push(
-      "A custom plan runs on its baseScope with its own stage changes, for this piece of work only: it writes no scope file, so its gate offers Approve / Approve and save as scope / Edit the plan / Reject (a matched plan: Approve / Edit the plan / Reject). On either approval, create it with --scope <baseScope> plus --skip <changes.skip> and --add <changes.add> (join each nonempty array with commas and omit an empty one; every entry must be a stage slug of lowercase letters, digits, and hyphens, and if one is anything else apply nothing and re-dispatch the composer), --depth <creationDepth> when the proposal carries one (exactly minimal, standard, or comprehensive), the creation flags, and the same --request id (a task-less composition passes its creation description after `--` instead). For Approve and save as scope, ask the human for a name with the same question tool as the gate, offering the composer's scopeName as the first choice, and once the creation command has succeeded run `" +
+      "A custom plan runs on its baseScope with its own stage changes, for this piece of work only: it writes no scope file, so its gate offers Approve / Approve and save as scope / Edit the plan / Reject (a matched plan: Approve / Edit the plan / Reject). On either approval, create it with --scope <baseScope> plus --skip <changes.skip> and --add <changes.add> (join each nonempty array with commas and omit an empty one; every entry must be a stage slug of lowercase letters, digits, and hyphens, and if one is anything else apply nothing and re-dispatch the composer), --depth <creationDepth> when the proposal carries one (exactly minimal, standard, or comprehensive), the creation flags, and the same --request id (a report-only or task-less composition also passes its creation description after `--`). For Approve and save as scope, ask the human for a name with the same question tool as the gate, offering the composer's scopeName as the first choice, and once the creation command has succeeded run `" +
         aidlcDispatcherInvocation("scope save") +
         " --name <name>` before re-running next; build the name yourself as lowercase words joined by hyphens, never paste it from the proposal unchecked, and if the command reports the name is taken, ask for another and run it again. The same command saves the running plan whenever the human later asks (\"save this plan as quick-fix\").",
     );
@@ -5083,7 +5087,32 @@ function routeNext(args: string[], projectDir: string | undefined): void {
   // starts work, so a missing copy may mean a repeated answer: carry on with
   // the work it started instead of creating it twice.
   let question: StoredQuestion | undefined;
-  if (flags.request !== undefined) {
+  const composition = flags.request === undefined ? null : readComposeEntry(questionDir, flags.request);
+  if (composition !== null && !flags.compose) {
+    // Approving a report-only or task-less composition: the description its
+    // proposal derived follows `--` and becomes the front request this work
+    // answers, naming the composition, so words said at that gate reach this
+    // work. The entry is spent here, and a later request replaces it.
+    if (!flags.intent) {
+      emit(errorDirective(
+        "Creating a composed plan needs the proposal's creationDescription: pass it after `--` with this --request id.",
+      ));
+      return;
+    }
+    if (latestFrontQuestionId(questionDir, Number.POSITIVE_INFINITY) !== composition.id) {
+      emit(errorDirective(
+        "This composed plan was replaced by a later request, so it cannot be created from here. Compose it again if it is still wanted.",
+      ));
+      return;
+    }
+    const authority = authoritativeProjectDescription(flags.intent);
+    if (!authority.error && !(authority.pastedDocumentPresent && authority.description.length === 0)) {
+      const described = saveQuestion(questionDir, flags.intent, flags.scope ?? "", "front", undefined, false, composition.id);
+      deleteQuestion(questionDir, composition.id);
+      flags.request = described.id;
+      question = described;
+    }
+  } else if (flags.request !== undefined && composition === null) {
     const found = readQuestion(questionDir, flags.request);
     if (!found) {
       pruneQuestions();
@@ -5734,6 +5763,11 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     // request by id; an in-flight reshape carries its text in the dispatch.
     if (flags.intent && !flags.request && !inFlight) {
       flags.request = saveQuestion(pd, flags.intent, flags.scope ?? "").id;
+    } else if (!flags.request && !inFlight) {
+      // A report-only or task-less composition is described only on approval,
+      // and its approval names this entry, so words said at its gate (plan
+      // approval off) reach the work it creates and no other.
+      flags.request = saveQuestion(pd, "", flags.scope ?? "", "compose").id;
     }
     emit(composeDispatchDirective(flags, inFlight));
     return;
