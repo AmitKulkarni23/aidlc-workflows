@@ -3230,12 +3230,42 @@ export function kiroIdeIgnoreSourceChecks(
     : [{ pass: true, label: `${KIRO_IGNORE_PREFIX} none hide ${harness}/ (${sources.length} file(s) checked)` }];
 }
 
+// A heartbeat names no launch, so only a recent one speaks for this one: in a
+// working session the hook for the prompt that asked for the doctor fired
+// moments ago. An older heartbeat may be another launch (yesterday's terminal,
+// or a coinstalled harness started differently).
+const RUNTIME_HOOK_EVIDENCE_MS = 10 * 60 * 1000;
+
+// The newest heartbeat of this project's hooks while they are firing now
+// (recent, not stale against the workflow's progress, and from a launch that
+// is still open). Firing hooks prove their runtime resolved, which the runtime
+// row would otherwise only predict from the system-wide PATH.
+export function firingHooksLastFired(projectDir: string, now = Date.now()): string | undefined {
+  const selection = resolveWorkflowSelection(projectDir);
+  const liveness = hookLiveness(
+    projectDir,
+    readAuditShardEvents(projectDir, selection.intent ?? undefined, selection.space),
+  );
+  const beat = (hook: string): number => {
+    const entry = liveness.heartbeatEntries.find((line) => line.startsWith(`${hook} `));
+    return entry === undefined ? Number.NaN : Date.parse(entry.slice(hook.length + 1));
+  };
+  // A session-end newer than every session-start: the launch that wrote these
+  // heartbeats has closed, and no later launch has started its hooks.
+  const launchClosed = Number.isFinite(beat("session-end")) && !(beat("session-start") >= beat("session-end"));
+  const newest = liveness.newestHeartbeat;
+  return newest !== null && !liveness.stale && !launchClosed && now - newest.timestampMs <= RUNTIME_HOOK_EVIDENCE_MS
+    ? newest.timestampRaw
+    : undefined;
+}
+
 export async function collectDoctorReport(
   projectDir: string,
   extraChecks: readonly DoctorCheck[] = [],
 ): Promise<DoctorReport> {
   const results: DoctorCheck[] = [];
-  results.push(...runtimeDoctorChecks(projectDir, harnessDir()));
+  const hooksLastFired = firingHooksLastFired(projectDir);
+  results.push(...runtimeDoctorChecks(projectDir, harnessDir(), hooksLastFired ? { hooksLastFired } : {}));
   results.push(instructionFileDoctorCheck(projectDir, harnessDir()));
   const compiled = isCompiledExecutable();
 
