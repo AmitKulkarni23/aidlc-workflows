@@ -217,8 +217,8 @@ const RECEIPT_PATTERN = /^[A-Za-z0-9_-]{8}$/;
 // The refusal a superseded tracked `continue` prints, in the person's terms.
 const SUPERSEDED_CONTINUE = "This `continue` was overtaken before it could answer.";
 
-// The shipped rule bundle fits one run-stage message; push org.md past the
-// transport cap so a delivery is chunked and carries receipts.
+// The shipped rule bundle fits one steering part; push org.md past it so a
+// delivery takes several parts, each carrying its receipt.
 function inflateRules(dir: string): void {
   appendFileSync(
     join(dir, "aidlc", "spaces", "default", "memory", "org.md"),
@@ -644,6 +644,25 @@ function keptWords(dir: string): string {
   return existsSync(wordsDir)
     ? readdirSync(wordsDir).map((name) => readFileSync(join(wordsDir, name), "utf-8")).join("\n")
     : "";
+}
+
+// Copilot's directive budget sends a stage's rules ahead of its run-stage: follow
+// the parts through tracked continues, as the conductor does.
+function followToRunStage(
+  dir: string,
+  session: string,
+  directive: Record<string, unknown>,
+  prefix: string,
+  form: CommandForm = "direct",
+): Record<string, unknown> {
+  expect(directive.kind).toBe("load-steering");
+  let reached = directive;
+  for (let part = 0; reached.kind === "load-steering"; part++) {
+    if (part > 20) throw new Error("steering did not converge");
+    reached = runLifecycle(dir, session, form, ["continue", String(reached.receipt)], `${prefix}-continue-${part}`).directive;
+  }
+  expect(reached.kind).toBe("run-stage");
+  return reached;
 }
 
 describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
@@ -1840,11 +1859,11 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     const dir = orchestrationProject();
     const session = "real-compiled-owner";
     const resumed = runLifecycle(dir, session, "compiled", ["--resume"], "compiled-resume");
-    // The shipped bundle fits one message: --resume answers the run-stage with
-    // its rules inline.
-    expect(resumed.directive.kind).toBe("run-stage");
-    expect(resumed.directive.stage).toBe("requirements-analysis");
-    expect(Array.isArray(resumed.directive.rules_content)).toBe(true);
+    // Under Copilot's directive budget --resume answers with the stage's rules
+    // first; the compiled continue then delivers its run-stage.
+    expect(resumed.directive).toMatchObject({ kind: "load-steering", stage: "requirements-analysis" });
+    expect(followToRunStage(dir, session, resumed.directive, "compiled-resume", "compiled"))
+      .toMatchObject({ stage: "requirements-analysis" });
 
     const routedDir = orchestrationProject();
     inflateRules(routedDir);
@@ -2475,7 +2494,8 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     // One nudge only: a second Stop with no progress lets the turn end.
     expect(stop(mid.dir, "approve-owner", true)).toBe("");
     const next = runLifecycle(mid.dir, "approve-owner", "source", ["next"], "approve-next");
-    expect(next.directive).toMatchObject({ kind: "run-stage", stage: "environment-provisioning" });
+    expect(followToRunStage(mid.dir, "approve-owner", next.directive, "approve-next"))
+      .toMatchObject({ kind: "run-stage", stage: "environment-provisioning" });
     const working = JSON.parse(stop(mid.dir, "approve-owner")) as { decision?: string; reason?: string };
     expect(working.decision).toBe("block");
     expect(working.reason).toContain("exact delivered AIDLC run-stage");
@@ -2709,7 +2729,7 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
         expect(executed.status, executed.stderr).toBe(0);
         runAdapter(dir, "post-tool", commandPayload(dir, session, command, undefined, true, executed.stdout));
         if (shape === "missing") {
-          expect(JSON.parse(executed.stdout)).toMatchObject({ kind: "run-stage" });
+          expect(JSON.parse(executed.stdout)).toMatchObject({ kind: "load-steering" });
           expect(marker(dir)).toMatchObject({
             delivery: "issued",
             active_attempt: { id: claim.attemptId, status: "failed" },
@@ -2723,6 +2743,8 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
         const stopped = runAdapter(dir, "continue-workflow", { ...FIXTURES.stop, cwd: dir, session_id: session });
         expect((JSON.parse(stopped.stdout) as { decision?: string }).decision).toBe("block");
         expect(runAdapter(dir, "guard-tool-call", commandPayload(dir, session, spec.text)).stdout).not.toContain('"permissionDecision":"deny"');
+        // The fresh next that recovery asks for reaches the stage through its rules part.
+        driveToRunStage(dir, session);
       }
     }
   });
@@ -2736,6 +2758,18 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     runAdapter(dir, "post-tool", {
       hook_event_name: "PostToolUse", session_id: session, tool_use_id: "vscode-attempt", cwd: dir,
       toolName: "runTerminalCommand", toolInput: { command: rewritten }, tool_response: executed.stdout,
+    });
+    const part = JSON.parse(executed.stdout) as { kind?: string; receipt?: string };
+    expect(part.kind).toBe("load-steering");
+    expect(marker(dir)).toMatchObject({ kind: "load-steering", delivery: "delivered" });
+    // The part's continue settles the run-stage through the same VS Code result shape.
+    const next = commandSpec(dir, "source", ["continue", String(part.receipt)]);
+    const continued = rewrittenCommand(runAdapter(dir, "guard-tool-call", commandPayload(dir, session, next.text, "vscode-continue")));
+    const reached = runShell(dir, continued);
+    expect(JSON.parse(reached.stdout)).toMatchObject({ kind: "run-stage" });
+    runAdapter(dir, "post-tool", {
+      hook_event_name: "PostToolUse", session_id: session, tool_use_id: "vscode-continue", cwd: dir,
+      toolName: "runTerminalCommand", toolInput: { command: continued }, tool_response: reached.stdout,
     });
     expect(marker(dir)).toMatchObject({ kind: "run-stage", delivery: "delivered" });
   });
@@ -2777,11 +2811,48 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
       .toBe("");
   });
 
+  test("22e: VS Code's cut of a terminal result over 20,000 characters is not a delivered directive", () => {
+    // What VS Code's run_in_terminal returns, and hands PostToolUse, for output
+    // over 20,000 characters: truncateLargeOutput in microsoft/vscode
+    // src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/outputHelpers.ts.
+    const vscodeCut = (output: string, savedTo?: string): string => {
+      const size = Math.ceil(output.length / 1024);
+      const header = savedTo
+        ? `[Output too large (${size}KB). Full output saved to: ${savedTo}]\n[Use readFile or grep to examine the full output.]\n\n`
+        : `[Output too large (${size}KB). Showing preview and tail.]\n\n`;
+      const preview = output.slice(0, 500);
+      const separator = "\n\n[... middle of output truncated ...]\n\n";
+      return header + preview + separator + output.slice(-(20_000 - header.length - preview.length - separator.length));
+    };
+    const dir = orchestrationProject();
+    const session = "vscode-cut-owner";
+    const spec = commandSpec(dir, "source", ["next"]);
+    for (const [index, savedTo] of [join(tmpdir(), "vscode-output.txt"), undefined].entries()) {
+      const attempt = `vscode-cut-${index}`;
+      const rewritten = rewrittenCommand(runAdapter(dir, "guard-tool-call", commandPayload(dir, session, spec.text, attempt)));
+      const executed = runShell(dir, rewritten);
+      expect(executed.status, executed.stderr).toBe(0);
+      // The same directive grown past the cut: the head still reads as one.
+      const directive = JSON.parse(executed.stdout) as Record<string, unknown>;
+      const shown = vscodeCut(JSON.stringify({ ...directive, narration: "x".repeat(20_000) }), savedTo);
+      expect(shown.length).toBeLessThanOrEqual(20_000);
+      expect(shown).toContain(`{"kind":"${String(directive.kind)}"`);
+      runAdapter(dir, "post-tool", {
+        hook_event_name: "PostToolUse", session_id: session, tool_use_id: attempt, cwd: dir,
+        toolName: "runTerminalCommand", toolInput: { command: rewritten }, tool_response: shown,
+      });
+      const settled = marker(dir);
+      expect(settled.delivery).not.toBe("delivered");
+      expect(settled).toMatchObject({ needs_rehydrate: true, active_attempt: { id: attempt, status: "failed" } });
+    }
+  });
+
   test("23: explicit Resume continues directly and does not arm a resume marker", () => {
     const dir = orchestrationProject();
     const resumed = runLifecycle(dir, "resume-direct-owner", "direct", ["next", "--resume"], "resume-direct");
-    expect(resumed.directive.kind).toBe("run-stage");
-    expect(resumed.directive.stage).toBe("requirements-analysis");
+    expect(resumed.directive).toMatchObject({ kind: "load-steering", stage: "requirements-analysis" });
+    expect(followToRunStage(dir, "resume-direct-owner", resumed.directive, "resume-direct"))
+      .toMatchObject({ stage: "requirements-analysis" });
     expect(marker(dir).resume).toBeUndefined();
   });
 
@@ -2847,9 +2918,10 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
         ["next", "--resume"],
         `legacy-${status}-resume`,
       );
-      expect(resumed.directive.kind).toBe("run-stage");
-      expect(resumed.directive.stage).toBe("requirements-analysis");
+      expect(resumed.directive).toMatchObject({ kind: "load-steering", stage: "requirements-analysis" });
       expect(marker(dir).resume).toMatchObject({ status: "superseded" });
+      expect(followToRunStage(dir, session, resumed.directive, `legacy-${status}-resume`))
+        .toMatchObject({ stage: "requirements-analysis" });
     }
   });
 
@@ -3312,7 +3384,8 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
       approvePlan(dir, session, recorded);
       if (when === "while the plan is being built") {
         const build = runLifecycle(dir, session, "direct", ["next"], "compact-build");
-        expect(build.directive).toMatchObject({ kind: "run-stage", plan_approval: { status: "approved" } });
+        expect(followToRunStage(dir, session, build.directive, "compact-build"))
+          .toMatchObject({ kind: "run-stage", plan_approval: { status: "approved" } });
       }
       const contextEpoch = Number(marker(dir).context_epoch ?? 0);
       const compacted = runAdapter(dir, "validate-state", { hook_event_name: "PreCompact", cwd: dir, session_id: session });
@@ -3320,7 +3393,7 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
       expect(marker(dir)).toMatchObject({ context_epoch: contextEpoch + 1, needs_rehydrate: true });
 
       const resumed = runLifecycle(dir, session, "direct", ["next"], "compact-resume");
-      expect(resumed.directive).toMatchObject({
+      expect(followToRunStage(dir, session, resumed.directive, "compact-resume")).toMatchObject({
         kind: "run-stage", stage: "code-generation", plan_approval: { status: "approved" },
       });
       expect(answer()).toBe("[Answer]: A. Approve Plan");
@@ -3337,7 +3410,8 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     const session = "copilot-plan-parked";
     approvePlan(dir, session, recorded);
     const build = runLifecycle(dir, session, "direct", ["next"], "plan-build");
-    expect(build.directive).toMatchObject({ kind: "run-stage", plan_approval: { status: "approved" } });
+    expect(followToRunStage(dir, session, build.directive, "plan-build"))
+      .toMatchObject({ kind: "run-stage", plan_approval: { status: "approved" } });
     expect(runLifecycle(dir, session, "source", ["park"], "plan-park").directive).toMatchObject({ kind: "parked" });
     expect(marker(dir)).toMatchObject({ kind: "parked" });
     const unparked = spawnSync(process.execPath, [join(dir, ".aidlc", "tools", "aidlc-state.ts"), "unpark", "--project-dir", dir], {
@@ -3349,7 +3423,7 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     expect(unparked.status, unparked.stderr).toBe(0);
 
     const resumed = runLifecycle(dir, session, "direct", ["next"], "plan-unparked");
-    expect(resumed.directive).toMatchObject({
+    expect(followToRunStage(dir, session, resumed.directive, "plan-unparked")).toMatchObject({
       kind: "run-stage", stage: "code-generation", plan_approval: { status: "approved" },
     });
     expect(answer()).toBe("[Answer]: A. Approve Plan");
@@ -3366,7 +3440,8 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     const session = "copilot-plan-parked-review";
     approvePlan(dir, session, recorded);
     const build = runLifecycle(dir, session, "direct", ["next"], "review-build");
-    expect(build.directive).toMatchObject({ kind: "run-stage", plan_approval: { status: "approved" } });
+    expect(followToRunStage(dir, session, build.directive, "review-build"))
+      .toMatchObject({ kind: "run-stage", plan_approval: { status: "approved" } });
     expect(runLifecycle(dir, session, "source", ["park"], "review-park").directive).toMatchObject({ kind: "parked" });
     const review = runAdapter(dir, "record-human-turn", {
       ...FIXTURES.userPromptSubmit, cwd: dir, session_id: session, prompt: "review the plan first",
@@ -3401,7 +3476,7 @@ describe("t249 Copilot hook adapter (live-captured payload fixtures)", () => {
     expect(recorded()).toHaveLength(1);
     expect(answer()).toBe("[Answer]: A. Approve Plan");
     const build = runLifecycle(dir, session, "direct", ["next"], "compact-before-reply-build");
-    expect(build.directive).toMatchObject({
+    expect(followToRunStage(dir, session, build.directive, "compact-before-reply-build")).toMatchObject({
       kind: "run-stage", stage: "code-generation", plan_approval: { status: "approved" },
     });
   });

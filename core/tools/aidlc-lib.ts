@@ -12,6 +12,8 @@ import {
   aidlcInvocation,
   aidlcToolInvocation,
   entrySkillInvocation,
+  type DirectiveLimit,
+  directiveLimitFor,
   isCompiledExecutable,
   resolveHarnessPath,
   runtimeHarnessDir,
@@ -602,6 +604,23 @@ export function documentExtractors(): ReadonlyMap<string, DocumentExtractorSpec>
 
 export function pluginsEnabled(): ReadonlySet<string> | null {
   return readShippedHarnessData().plugins;
+}
+
+/**
+ * The largest directive, in UTF-8 bytes, the host that prints this engine's
+ * results shows whole, and that host; null when no harness declares a limit.
+ * Read from the engine's own harness data and from every harness installed in
+ * `projectDir`, the smallest winning (see directiveLimitFor). A project file
+ * written before the field existed takes it from the running release's copy of
+ * that harness, and a larger project value is capped by that copy's. Never
+ * throws: a limit must not break the directive it sizes.
+ */
+export function harnessDirectiveLimit(projectDir?: string): DirectiveLimit | null {
+  try {
+    return directiveLimitFor([harnessDataPath()], projectDir);
+  } catch {
+    return null;
+  }
 }
 
 export function projectFlags(projectDir?: string): ProjectFlagsRecord | null {
