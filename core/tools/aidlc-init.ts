@@ -241,6 +241,9 @@ type Baseline = {
   harnessDir: string;
   mcpMode: "defaults" | "none";
   files: Record<string, string>;
+  // Set once `files` holds only shipped paths. An older manifest may also
+  // record the project's own files under the harness dir (#1516).
+  shippedOnly?: true;
   entries?: Record<string, Record<string, string>>;
   rootContributions: Record<string, RootContribution>;
 };
@@ -249,6 +252,7 @@ type PreparedRefreshSource = {
   root: string;
   cleanup?: string;
   regenerated: Set<string>;
+  projectOverlays?: ReadonlySet<string>;
   entries?: Baseline["entries"];
   notes: string[];
 };
@@ -4599,6 +4603,7 @@ function prepareRefreshSource(
     regenerated.add(`${descriptor.harnessDir}/tools/data/scope-grid.json`);
   }
 
+  const projectOverlays = new Set<string>();
   for (const directory of descriptor.managedDirectories) {
     if (directory !== descriptor.harnessDir && directory !== ".agents") continue;
     const currentDir = join(projectDir, directory);
@@ -4608,12 +4613,14 @@ function prepareRefreshSource(
       const staged = join(root, rel);
       if (
         existsSync(staged) ||
-        prior?.files[rel] ||
+        (prior?.shippedOnly && prior.files[rel]) ||
+        rel === `${descriptor.harnessDir}/tools/data/aidlc-manifest.json` ||
         !generatedOverlayCandidate(rel, descriptor.harnessDir)
       ) continue;
       mkdirSync(dirname(staged), { recursive: true });
       cpSync(join(projectDir, rel), staged, { preserveTimestamps: true });
       regenerated.add(rel);
+      projectOverlays.add(rel);
     }
   }
 
@@ -4778,7 +4785,7 @@ function prepareRefreshSource(
       }
     }
   }
-  return { root, cleanup, regenerated, entries, notes };
+  return { root, cleanup, regenerated, projectOverlays, entries, notes };
   } catch (error) {
     rmSync(cleanup, { recursive: true, force: true });
     throw error;
@@ -6602,6 +6609,7 @@ function planManagedFiles(
   nextHashes: Record<string, string>,
   regenerated: ReadonlySet<string>,
   retainBaseline: boolean,
+  projectOverlays: ReadonlySet<string> = new Set(),
 ): void {
   const shipped = new Set<string>();
   for (const directory of descriptor.managedDirectories) {
@@ -6641,7 +6649,13 @@ function planManagedFiles(
         }
         continue;
       }
+      const projectOwned = projectOverlays.has(rel);
+      if (projectOwned && targetRegular && currentHash === hash) {
+        actions.push({ path: rel, action: "preserve", detail: "project-owned" });
+        continue;
+      }
       if (
+        !projectOwned &&
         ![
           `${descriptor.harnessDir}/tools/data/harness.json`,
           `${descriptor.harnessDir}/tools/data/stage-graph.json`,
@@ -8360,6 +8374,7 @@ export async function main(
       files,
       prepared.regenerated,
       retainBaseline,
+      prepared.projectOverlays,
     );
     if (!selected.projectProjection) {
       planRootIntegrations(
@@ -8472,6 +8487,7 @@ export async function main(
       harnessDir: stamp.harnessDir,
       mcpMode,
       files,
+      ...(!selected.projectProjection || prior?.shippedOnly ? { shippedOnly: true as const } : {}),
       entries: prepared.entries,
       rootContributions,
     };
