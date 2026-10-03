@@ -3661,6 +3661,18 @@
     },
     {
       "unitClass": "function",
+      "unitId": "function:fileIdentity",
+      "minMechanism": "none",
+      "coveredBy": [
+        {
+          "file": "tests/unit/t329-document-input.test.ts",
+          "mechanism": "cli"
+        }
+      ],
+      "status": "covered"
+    },
+    {
+      "unitClass": "function",
       "unitId": "function:filteredRawIndexEntries",
       "minMechanism": "none",
       "coveredBy": [],
@@ -9024,6 +9036,18 @@
       "coveredBy": [
         {
           "file": "tests/unit/t315-plugin-build.test.ts",
+          "mechanism": "cli"
+        }
+      ],
+      "status": "covered"
+    },
+    {
+      "unitClass": "function",
+      "unitId": "function:sameFileIdentity",
+      "minMechanism": "none",
+      "coveredBy": [
+        {
+          "file": "tests/unit/t329-document-input.test.ts",
           "mechanism": "cli"
         }
       ],
