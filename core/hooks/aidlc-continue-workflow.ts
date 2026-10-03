@@ -144,6 +144,8 @@ import {
   docsRoot,
   errorMessage,
   findIntentByUuid,
+  listIntents,
+  parseRecordIntentKey,
   effectiveUnitGateRhythm,
   getField,
   stateDigest,
@@ -1600,43 +1602,11 @@ try {
   // counter still bounds any block. We never crash on bad input.
 }
 
-// A confirmed second intent deliberately moves the shared cursor before this
-// old conversation ends. The PostToolUse hook writes an exact per-session
-// receipt for that transition. Allow only when the receipt is fresh, the
-// session now owns the created intent. The shared cursor is intentionally not
-// evidence here: another session may move it before this Stop event.
-if (sessionId) {
-  const handoff = readSessionIntentHandoff(projectDir, sessionId);
-  if (handoff) {
-    const now = Date.now();
-    const fresh =
-      handoff.issuedAtMs <= now &&
-      now - handoff.issuedAtMs <= SESSION_INTENT_HANDOFF_TTL_MS;
-    const target = findIntentByUuid(projectDir, handoff.toIntentUuid);
-    const exactBoundary =
-      fresh &&
-      readSessionIntentUuid(projectDir, sessionId) === handoff.toIntentUuid &&
-      target !== null &&
-      selection.space === target.space &&
-      selection.intent === target.dirName;
-    if (exactBoundary) {
-      clearSessionIntentHandoff(projectDir, sessionId);
-      resetGuard(projectDir);
-      recordHookDrop(
-        projectDir,
-        HOOK_NAME,
-        "allowing stop at the exact post-create fresh-session handoff boundary",
-      );
-      return allowStop();
-    }
-    if (!fresh) clearSessionIntentHandoff(projectDir, sessionId);
-  }
-}
-
 // Usage bookkeeping - persist the live transcript path and fold its new turns
 // into the durable usage ledger under the current stage. This is THE turn-end
 // producer of usage-ledger.json alongside the per-tool Pre/PostToolUse fold:
-// without it the statusline cost segment lags the final turn. Both calls are
+// without it the statusline cost segment lags the final turn, so it runs before
+// any early allow below (an intent handoff ends the turn there too). Both calls are
 // cheap (the fold advances per-file cursors, so only new turns are read) and
 // BOTH are fully guarded - a usage failure must NEVER break or delay the Stop
 // hook, so any throw is swallowed here rather than propagated. Only Claude
@@ -1658,6 +1628,54 @@ if (transcriptPath && transcriptFormat === "claude") {
     );
   } catch {
     // best-effort - usage never breaks the hook
+  }
+}
+
+// A confirmed second intent, or a switch to another intent or space, moves
+// this session to another intent before the turn ends. The step that moved it
+// (the PostToolUse hook after a create, the utility for a switch) writes an
+// exact per-session receipt for that transition. Allow only when the receipt
+// is fresh and the session now owns the destination intent. The shared cursor
+// is intentionally not evidence here: another session may move it before this
+// Stop event.
+if (sessionId) {
+  const handoff = readSessionIntentHandoff(projectDir, sessionId);
+  if (handoff) {
+    const now = Date.now();
+    const fresh =
+      handoff.issuedAtMs <= now &&
+      now - handoff.issuedAtMs <= SESSION_INTENT_HANDOFF_TTL_MS;
+    // A record with no registry row is named by space and record instead of
+    // a UUID: the session selects exactly that record and carries no stamp, or
+    // the stamp of the row the record has gained since (a repair elsewhere).
+    const record = parseRecordIntentKey(handoff.toIntentUuid);
+    const recordEntry = record
+      ? listIntents(projectDir, record.space).find((entry) => entry.dirName === record.dirName)
+      : undefined;
+    const target = record
+      ? recordEntry ? { space: record.space, dirName: record.dirName } : null
+      : findIntentByUuid(projectDir, handoff.toIntentUuid);
+    const stamp = readSessionIntentUuid(projectDir, sessionId);
+    const stampMatches = record
+      ? stamp === null || (!!recordEntry?.uuid && stamp === recordEntry.uuid)
+      : stamp === handoff.toIntentUuid;
+    const exactBoundary =
+      fresh &&
+      stampMatches &&
+      target !== null &&
+      selection.space === target.space &&
+      selection.intent === target.dirName;
+    if (exactBoundary) {
+      clearSessionIntentHandoff(projectDir, sessionId);
+      resetGuard(projectDir);
+      recordHookDrop(
+        projectDir,
+        HOOK_NAME,
+        "allowing stop at the exact intent handoff boundary (create or switch)",
+      );
+      return allowStop();
+    }
+    if (!fresh) clearSessionIntentHandoff(projectDir, sessionId);
   }
 }
 

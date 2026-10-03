@@ -129,6 +129,7 @@ import {
   workflowParticipation,
   ActiveDirectiveLockContendedError,
   advanceContinuationCursor,
+  clearSessionIntentSwitch,
   activeUnitCheckpoint,
   approvedConstructionUnits,
   attemptEventDefinitelyBefore,
@@ -808,6 +809,16 @@ function legacyKiroPlanApprovalSession(projectDir: string): string | null {
 
 function writePrepared(prepared: PreparedEmission): void {
   writeFileSync(1, `${prepared.serialized}\n`, "utf-8");
+  // Stage work handed to the session, by any path (a fresh publication, the
+  // same work handed over again, or a `continue` to the next part), ends a
+  // switch's one-shot stop, so the loop holds it like any other work (#1263).
+  const kind = prepared.transported.kind;
+  if (
+    prepared.projectDir && !isReadOnlyEngineProbe() &&
+    (kind === "run-stage" || kind === "load-steering" || kind === "invoke-swarm")
+  ) {
+    clearSessionIntentSwitch(prepared.projectDir);
+  }
 }
 
 function legacyPlanApprovalRecoveryDirective(): AskDirective {
