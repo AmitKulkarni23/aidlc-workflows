@@ -13639,6 +13639,10 @@
           "mechanism": "cli"
         },
         {
+          "file": "tests/unit/t-code-generation-resume.test.ts",
+          "mechanism": "cli"
+        },
+        {
           "file": "tests/unit/t-copilot-directive-budget.test.ts",
           "mechanism": "cli"
         },
