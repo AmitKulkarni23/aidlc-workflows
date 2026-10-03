@@ -668,7 +668,14 @@ Each run captures stdout/stderr in the checkout root's
 `tmp/ci-deterministic/run.log`, prints that path and the actual log stamp, and
 preserves both this capture and `tests/logs/` after successful sanitization.
 Artifacts use the caller's label plus the actual runner OS and retain evidence
-for 90 days.
+for 90 days. `ci.yml` passes `evidence-optional: true` because no workflow
+downloads its `ci-deterministic-*` artifacts: a failed upload is reported on
+the job but does not fail it, so an upload timeout cannot drop a PR whose tests
+passed. The test step's own exit code still fails the job. CI's
+`ci-native-*` and `production-guard-evidence` uploads follow the same rule.
+Full Suite does not pass the input, so the `full-suite-deterministic-*`
+uploads of a manual full verification run stay required: that run exists to
+hand a person its evidence, and no queued PR waits on it.
 
 For platform verification before a nightly fix lands, dispatch
 `gh workflow run ci.yml --ref <branch> -f platform_regressions=true`. This expands
@@ -925,7 +932,7 @@ bash tests/run-tests.sh --debug -P 8 --production-guards --unit --integration \
 ```
 
 The job creates that log directory and always uploads its logs and `tests/logs/`
-as `production-guard-evidence`. The existing `test` aggregate (`Tests (smoke +
+as `production-guard-evidence`; a failed upload does not fail the job. The existing `test` aggregate (`Tests (smoke +
 unit)`, retained as the required-check name) requires `test_guards` to succeed
 alongside smoke, every unit shard, and deterministic integration on every
 trigger, plus the native-terminal and live OS-isolation matrices outside PR
