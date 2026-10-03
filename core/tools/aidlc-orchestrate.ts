@@ -346,7 +346,16 @@ import {
   markdownFilesUnder,
   shippedInlineContextEntries,
 } from "./aidlc-inline-context.ts";
-import { detectWorkspace, type InferResult, inferScopeFromText } from "./aidlc-utility.ts";
+import {
+  detectWorkspace,
+  GREENFIELD_RE_SKIP_LABEL,
+  greenfieldWorkspaceGainedCode,
+  type InferResult,
+  inferScopeFromText,
+  projectTypeRecordedAsPersons,
+  reverseEngineeringOwedBehindCursor,
+  scanSummary,
+} from "./aidlc-utility.ts";
 import { checkboxIsUnitProjection, ledgerStageActivity } from "./aidlc-doctor-bundle.ts";
 import {
   aidlcDispatcherInvocation,
@@ -1524,11 +1533,12 @@ function scopeCommands(
   }));
 }
 
-// The depth, test strategy, and sensors, learnings, and summary confirmation
-// switches typed with a description ride on the plan offer's answer commands,
-// so the work the person confirms is created as the offer previewed it. Each
-// was checked against its allowed words when parsed. Plan approval rides only
-// as on: only the person's own words turn it off, on their own path.
+// The depth, test strategy, project type, and sensors, learnings, and summary
+// confirmation switches typed with a description ride on the plan offer's
+// answer commands, so the work the person confirms is created as the offer
+// previewed it. Each was checked against its allowed words when parsed. Plan
+// approval rides only as on: only the person's own words turn it off, on their
+// own path.
 const CARRIED_CEREMONY_KEYS = ["sensors", "learnings", "summary_confirmation"] as const;
 
 function carriedCeremonyFlags(flags: ParsedFlags): string[] {
@@ -1545,6 +1555,7 @@ function carriedCreationFlags(flags: ParsedFlags): string {
   const carried: string[] = [];
   if (flags.depth) carried.push(`--depth ${flags.depth}`);
   if (flags.testStrategy) carried.push(`--test-strategy ${flags.testStrategy}`);
+  if (flags.projectType) carried.push(`--project-type ${flags.projectType}`);
   carried.push(...carriedCeremonyFlags(flags));
   return carried.length > 0 ? ` ${carried.join(" ")}` : "";
 }
@@ -1868,6 +1879,66 @@ function newWorkRoutingAskDirective(
 
 function printDirective(message: string): PrintDirective {
   return { kind: "print", message };
+}
+
+// The question for a folder set up as a new project that now holds code.
+// Null when the type was the person's word, Construction has started, or the
+// folder still scans as a new project.
+function projectTypeAskDirective(
+  projectDir: string,
+  stateContent: string,
+  currentSlug: string,
+): AskDirective | null {
+  let scan: ReturnType<typeof greenfieldWorkspaceGainedCode> = null;
+  try {
+    scan = greenfieldWorkspaceGainedCode(projectDir, stateContent);
+  } catch {
+    // An unreadable folder is not a reason to stop the person's work.
+    return null;
+  }
+  if (scan === null) return null;
+  const graph = loadGraph();
+  const reIndex = graph.findIndex((stage) => stage.slug === "reverse-engineering");
+  const behind = reIndex >= 0 && graph.findIndex((stage) => stage.slug === currentSlug) > reIndex;
+  const leftOut = (getField(stateContent, "Stages to Skip") ?? "").includes(GREENFIELD_RE_SKIP_LABEL);
+  const current = nodeForSlug(currentSlug)?.name ?? currentSlug;
+  const yes = leftOut
+    ? `Yes: I'll scan it and document it with Reverse Engineering${behind ? `, then we continue at ${current}` : " when we reach that step"}.`
+    : "Yes: I'll treat it as existing code, so the stages ahead build on it.";
+  return {
+    kind: "ask",
+    ask_type: "project-type",
+    response_route: "command",
+    question:
+      `This folder now has code (${scanSummary(scan)}). We started this as a new project because the ` +
+        `folder had no code then${leftOut ? ", so I left out Reverse Engineering" : ""}. Is it existing code to work on? ` +
+        `${yes} No: it stays a new project and I won't ask again.`,
+    existing_code_command: reclassifyCommand(projectDir, "brownfield"),
+    new_project_command: reclassifyCommand(projectDir, "greenfield"),
+  };
+}
+
+// The reclassify command for the piece of work selected now, named exactly, so
+// the answer lands on the work it was about even if another chat switches
+// the selection in between.
+function reclassifyCommand(projectDir: string, type: "greenfield" | "brownfield"): string {
+  const selection = engineSelection(projectDir);
+  const target = selection.intent
+    ? ` --intent ${shellArg(selection.intent)} --space ${shellArg(selection.space)}`
+    : "";
+  return `${aidlcDispatcherInvocation("workspace reclassify")} --project-type ${type}${target}`;
+}
+
+// True when `--project-type` is the whole request: nothing else for routing
+// to carry on with afterwards.
+function projectTypeIsWholeRequest(flags: ParsedFlags): boolean {
+  return !(
+    flags.stage || flags.phase || flags.single || flags.compose || flags.resume ||
+    flags.scope || flags.positionalScope || flags.depth || flags.testStrategy || flags.review ||
+    flags.changeControl || (flags.ceremony && Object.keys(flags.ceremony).length > 0) ||
+    flags.planChanges || flags.intent || flags.request || flags.continue || flags.record ||
+    flags.newScope || flags.report || flags.claim || flags.release
+  );
 }
 
 function noticeDirective(message: string): NoticeDirective {
@@ -2358,6 +2429,7 @@ function effectiveScopeCostSummary(
   overrides?: Partial<CeremonyPolicy>,
   review?: ReviewClass,
   planChanges?: PlanChanges,
+  declaredType?: "greenfield" | "brownfield",
 ) {
   const scoped = scopeCostSummary(scope);
   if (!scoped) return null;
@@ -2378,9 +2450,10 @@ function effectiveScopeCostSummary(
   // whether the preview says no reviewers.
   const off = review === undefined ? ceremonyOffList(scope, policy) : scopeSettingsOffList(review, policy);
   const stages = plan ?? loadScopeMapping()[scope]?.stages;
+  // The type the person declared wins over the scan, as at creation.
   if (
     stages?.["reverse-engineering"] !== "EXECUTE" ||
-    detectedProjectType(projectDir) !== "greenfield"
+    (declaredType ?? detectedProjectType(projectDir)) !== "greenfield"
   ) {
     return { ...nominal, off };
   }
@@ -2401,6 +2474,7 @@ function costClause(
   review?: ReviewClass,
   planChanges?: PlanChanges,
   request: string | null = null,
+  declaredType?: "greenfield" | "brownfield",
 ): string {
   // Plan approval off the person asked for before the work existed is part of
   // what creation will do, so the preview says so.
@@ -2414,7 +2488,7 @@ function costClause(
     ? planApprovalOffForOpenRequest(projectDir, session)
     : planApprovalOffAtCreation(projectDir, session, request));
   const c = effectiveScopeCostSummary(
-    scope, projectDir, asked ? { ...overrides, plan_approval: "off" } : overrides, review, planChanges,
+    scope, projectDir, asked ? { ...overrides, plan_approval: "off" } : overrides, review, planChanges, declaredType,
   );
   if (!c) return "";
   const perUnit = c.perUnitStages > 0
@@ -2432,6 +2506,7 @@ interface ParsedFlags {
   phase?: string;
   depth?: string;
   testStrategy?: string;
+  projectType?: "greenfield" | "brownfield"; // --project-type: the person's word on new project vs existing code
   review?: string; // --review <adversarial|advisory|none>: per-run review-class override
   changeControl?: string; // --guard-policy <strict|relaxed|off> (retired spelling --change-control): the per-intent Guard Policy
   ceremony?: Partial<CeremonyPolicy>;
@@ -2658,6 +2733,17 @@ function parseNextFlags(args: string[]): ParsedFlags {
         }
         i++;
       }
+    } else if (a === "--project-type") {
+      // Echoed into the creation or reclassify command, so only the two words pass.
+      const value = args[i + 1];
+      const word = value?.toLowerCase();
+      if (value === undefined || value.startsWith("--")) {
+        flags.parseError = "--project-type requires <greenfield|brownfield>.";
+      } else {
+        if (word === "greenfield" || word === "brownfield") flags.projectType = word;
+        else flags.parseError = `--project-type requires <greenfield|brownfield>; received "${value}".`;
+        i++;
+      }
     } else if (a === "--skip" || a === "--add") {
       // Stage slugs echoed into the creation command: each must name a stage.
       const value = args[i + 1];
@@ -2822,7 +2908,7 @@ function freshWorkOfferDirective(
     // Preview the ceremony the user is confirming: stage/gate counts from the
     // compiled grid (never estimates). Drop the clause if the scope does not
     // resolve (a fixture tree without it) rather than emit a broken preview.
-    const clause = costClause(inferred.scope, pd, flags.ceremony);
+    const clause = costClause(inferred.scope, pd, flags.ceremony, undefined, undefined, null, flags.projectType);
     const cost = clause ? ` - ${clause}` : "";
     return scopeConfirmAskDirective(
       `This looks like "${inferred.scope}" work, so I'd run the "${inferred.scope}" plan for: "${requestPreview(intentText)}"${cost}. ` +
@@ -2838,10 +2924,10 @@ function freshWorkOfferDirective(
   // user calibrates the order-of-magnitude difference before deciding, and
   // sees bugfix even when the description gave no word to match. Fall back
   // to bare names if any scope does not resolve.
-  const bugfix = effectiveScopeCostSummary("bugfix", pd);
-  const express = effectiveScopeCostSummary("express", pd);
-  const classic = effectiveScopeCostSummary("classic", pd);
-  const feat = effectiveScopeCostSummary("feature", pd);
+  const bugfix = effectiveScopeCostSummary("bugfix", pd, undefined, undefined, undefined, flags.projectType);
+  const express = effectiveScopeCostSummary("express", pd, undefined, undefined, undefined, flags.projectType);
+  const classic = effectiveScopeCostSummary("classic", pd, undefined, undefined, undefined, flags.projectType);
+  const feat = effectiveScopeCostSummary("feature", pd, undefined, undefined, undefined, flags.projectType);
   const fallbackExamples = [...validScopes()].slice(0, 3).join(", ") || "an explicit scope";
   const examples = bugfix && express && classic && feat
     ? `bugfix = ${bugfix.execute} of ${bugfix.total} stages, express = ${express.execute}, classic = ${classic.execute}, feature = all ${feat.execute}`
@@ -2925,6 +3011,7 @@ function createPrintDirective(
   }
   if (flags.depth) cmd.push(`--depth ${flags.depth}`);
   if (flags.testStrategy) cmd.push(`--test-strategy ${flags.testStrategy}`);
+  if (flags.projectType) cmd.push(`--project-type ${flags.projectType}`);
   if (flags.review) cmd.push(`--review ${flags.review}`);
   if (flags.changeControl) cmd.push(`--guard-policy ${flags.changeControl}`);
   for (const key of CEREMONY_KEYS) {
@@ -2935,7 +3022,9 @@ function createPrintDirective(
   // Disclose the ceremony on the print: an explicitly named scope creates
   // directly (no confirm ask by design), so the stage/gate counts ride here.
   // Omit the parenthetical when the scope does not resolve (fixture trees).
-  const clause = costClause(scope, projectDir, flags.ceremony, flags.review as ReviewClass | undefined, flags.planChanges, requestId);
+  const clause = costClause(
+    scope, projectDir, flags.ceremony, flags.review as ReviewClass | undefined, flags.planChanges, requestId, flags.projectType,
+  );
   const cost = clause ? ` (${clause})` : "";
   const runCmd = `Run \`${aidlcDispatcherInvocation("intent create")} ${cmd.join(" ")}\``;
   const directive = flags.newIntent
@@ -2954,7 +3043,23 @@ function createPrintDirective(
   directive.narration = clause
     ? `Setting up a ${scope} workflow for this: ${clause}.`
     : `Setting up a ${scope} workflow for this.`;
+  // Say it while the person can still correct it: an empty folder starts as a
+  // new project, which drops Reverse Engineering from the plan.
+  if (!flags.projectType && newProjectDropsReverseEngineering(scope, projectDir, flags.planChanges)) {
+    directive.narration +=
+      " The folder has no code yet, so I'm starting this as a new project without Reverse Engineering. If the work is on existing code, tell me.";
+  }
   return directive;
+}
+
+function newProjectDropsReverseEngineering(
+  scope: string,
+  projectDir: string,
+  planChanges?: PlanChanges,
+): boolean {
+  const planned = planChanges ? planWithChanges(scope, planChanges) : null;
+  const stages = planned && planned.errors.length === 0 ? planned.stages : loadScopeMapping()[scope]?.stages;
+  return stages?.["reverse-engineering"] === "EXECUTE" && detectedProjectType(projectDir) === "greenfield";
 }
 
 // The composer-dispatch print for a compose request (the adaptive-workflows
@@ -3015,9 +3120,10 @@ function composeDispatchDirective(
           `On approval, run \`next --scope <scopeName> --request ${flags.request} -- <creationDescription>\` (a custom plan names its baseScope instead and adds its typed changes, below), with the description as one shell-safe argument: the request id ties this work to its gate, and it works once.`,
       );
     }
-    // Levels and switches typed with the request ride on to creation: a typed
-    // depth replaces the plan's creationDepth, a typed test strategy keeps it,
-    // and a typed switch is the person's value for that setting.
+    // Levels, a project type, and switches typed with the request ride on to
+    // creation: a typed depth replaces the plan's creationDepth, a typed test
+    // strategy or project type is added alongside it, and a typed switch is
+    // the person's value for that setting.
     const typedLevels = carriedCreationFlags(flags).trim();
     if (typedLevels) {
       parts.push(
@@ -3028,6 +3134,13 @@ function composeDispatchDirective(
           (carriedCeremonyFlags(flags).length > 0
             ? " A switch typed here is the person's choice: show it on the gate's Scope settings row and pass it in place of any creationSettings flag for the same setting."
             : ""),
+      );
+    }
+    // The person's word on new project vs existing code outranks the scan, so
+    // the plan the composer scores is the one creation records.
+    if (flags.projectType) {
+      parts.push(
+        `The person said this is ${flags.projectType === "brownfield" ? "existing code" : "a new project"}: the composer plans it as ${flags.projectType}, passing \`--project-type ${flags.projectType}\` to \`graph ars\` and \`graph validate-grid\` in place of the scan's projectType.`,
       );
     }
     if (flags.report) {
@@ -5461,7 +5574,7 @@ function routeNext(args: string[], projectDir: string | undefined): void {
   // open to the normal `next`.
   if (!flags.readOnly && !flags.config && !flags.configCommand && !flags.workspaceCommand && !flags.orchestratorVerb && !flags.pluginCommand && !flags.knowledgeCommand && !flags.stage && !flags.phase &&
       !flags.scope && !flags.positionalScope && !flags.intent && !flags.resume &&
-      !flags.depth && !flags.testStrategy && !flags.review &&
+      !flags.depth && !flags.testStrategy && !flags.projectType && !flags.review &&
       !flags.single && !flags.compose && !flags.newScope && !flags.report &&
       !flags.claim && !flags.release) {
     try {
@@ -5810,6 +5923,28 @@ function routeNext(args: string[], projectDir: string | undefined): void {
         `intent with \`/aidlc intent <name>\` (\`/aidlc intent list --all\` shows archived ones).${NEW_WORK_HINT}`,
     });
     return;
+  }
+  // The person's word on new project vs existing code comes first, whatever
+  // else the request carries (a jump, a single run, compose, a setting):
+  // reclassify records it, and the same request run again finds it recorded
+  // and carries on, so nothing typed with it is dropped.
+  // Said on its own it always rescans and replies, then routing goes on with a
+  // bare `next`; said with more, once the type is recorded the rest runs. New
+  // work described over a finished workflow is new work: the type rides on to
+  // its creation instead of relabelling the finished one.
+  const newWorkOverFinished = Boolean(flags.intent?.trim()) && stateContent !== null &&
+    workflowFinished(stateContent, getField(stateContent, "Scope") ?? "");
+  if (stateContent && flags.projectType && !flags.newIntent && !newWorkOverFinished) {
+    const alone = projectTypeIsWholeRequest(flags);
+    if (alone || !projectTypeRecordedAsPersons(stateContent, flags.projectType)) {
+      emit(printDirective(
+        `Run \`${reclassifyCommand(pd, flags.projectType)}\` and print its output verbatim, then ` +
+          (alone
+            ? "re-run `next` to continue."
+            : "run the same `next` command again to carry on with the rest of the request."),
+      ));
+      return;
+    }
   }
   // The active intent's RELATIVE record-dir prefix (aidlc/spaces/<sp>/intents/
   // <slug>-<id8>), threaded into every run-stage directive so the conductor's
@@ -6492,6 +6627,27 @@ function routeNext(args: string[], projectDir: string | undefined): void {
   const checkboxes = parseCheckboxes(stateContent);
   const currentState = checkboxStateOf(checkboxes, currentSlug);
 
+  // A folder set up as a new project gained code before Construction: ask the
+  // person which it is, at a stage boundary rather than over an open gate.
+  // Never flipped here; either answer records the type as theirs.
+  if (currentState !== "awaiting-approval" && currentState !== "revising") {
+    const askDirective = projectTypeAskDirective(pd, stateContent, currentSlug);
+    if (askDirective) {
+      emit(askDirective);
+      return;
+    }
+  }
+  // Reverse Engineering went back on the plan behind the cursor (the person
+  // said this is existing code): run it now with a redo jump, which leaves the
+  // finished stages alone; once it is approved the walk returns here.
+  if (reverseEngineeringOwedBehindCursor(stateContent)) {
+    emit(printDirective(
+      `Reverse Engineering is on the plan and has not run. Run \`${aidlcToolInvocation("jump")} execute --target reverse-engineering --direction redo --scope ${scope}\` ` +
+        `to run it now (finished stages stay finished, and the workflow returns to ${currentSlug} after it), then re-run \`next\` to continue.`,
+    ));
+    return;
+  }
+
   // If the current stage is still in-flight (pending / in-progress /
   // awaiting-approval / revising), the next move is normally to run THAT stage
   // — the workflow has not yet completed it. A plan-SKIP mismatch is recovered
@@ -6526,7 +6682,7 @@ function routeNext(args: string[], projectDir: string | undefined): void {
       ));
       return;
     }
-    if (currentState !== "in-progress" && currentState !== "revising" && currentState !== "skipped") {
+    if (currentState !== "in-progress" && currentState !== "revising" && currentState !== "skipped" && currentState !== "awaiting-approval") {
       emit(errorDirective(
         `Stage "${currentSlug}" is SKIP in the approved workflow plan but its active cursor state is ` +
           `"${currentState ?? "missing"}". Refusing to emit run-stage; repair the inconsistent state before continuing.`,
@@ -10929,10 +11085,14 @@ function handleReport(args: string[], projectDir: string | undefined): void {
         return;
       }
     }
+    // A stage at its open gate is skipped only when the plan no longer runs
+    // it (the person said the work is a new project): their decision closes
+    // the gate as skipped.
     if (
       stageCheckbox.state !== "in-progress" &&
       stageCheckbox.state !== "revising" &&
-      stageCheckbox.state !== "skipped"
+      stageCheckbox.state !== "skipped" &&
+      !(stageCheckbox.state === "awaiting-approval" && planAction === "SKIP")
     ) {
       emit(errorDirective(
         `Stage "${slug}" is ${stageCheckbox.state}; only an active, revising, or interrupted skipped stage can be routed as skipped.`,
