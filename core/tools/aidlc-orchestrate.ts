@@ -310,6 +310,7 @@ import {
   steeringReceiptFor,
   steeringReceiptMatches,
   steeringTokenKeyPathFor,
+  takeSessionSelectionNotice,
 } from "./aidlc-lib.ts";
 import { reviewRecoverySpentMessage } from "./aidlc-log.ts";
 import {
@@ -593,6 +594,18 @@ function prepareEmission(directive: Directive): PreparedEmission {
     transported = withChangeNotices(transported, directive.change_notices ?? []);
     if (activeStageValidityAdvisory) {
       transported.stage_validity = activeStageValidityAdvisory;
+    }
+  }
+  // A conversation whose prompt hook cannot add context (Cursor) left its
+  // rebind line for this step: another chat moved the selection. It rides the
+  // first step the person hears (never a rules part), once.
+  if (
+    engineProjectDir && engineSessionId && transported.kind !== "load-steering" &&
+    !isReadOnlyEngineProbe() && !isRouteCheckProbe()
+  ) {
+    const selectionNotice = takeSessionSelectionNotice(engineProjectDir, engineSessionId);
+    if (selectionNotice) {
+      transported = withChangeNotices(transported, [selectionNotice, ...(transported.change_notices ?? [])]);
     }
   }
   const result = validateDirective(transported);
