@@ -5773,6 +5773,20 @@ export function resolveWorkflowSelection(
   projectDir: string,
   options: WorkflowSelectionOptions = {},
 ): WorkflowSelection {
+  // An explicit selector becomes one path segment, so it must not be a path: a
+  // "../" in --space or --intent could otherwise reach a record outside the
+  // project. Every command that takes them resolves them here. Any name that
+  // stays one segment still resolves, as before (an empty intent is the legacy
+  // flat record). A backslash separates only on Windows; elsewhere it is a
+  // filename character a teammate's migrated record may carry.
+  const isPath = (value: string): boolean =>
+    value === "." || value === ".." || /[/\0]/.test(value) || (process.platform === "win32" && value.includes("\\"));
+  if (options.space !== undefined && isPath(options.space)) {
+    throw new Error(`"${options.space}" is not a space name: it is a path.`);
+  }
+  if (options.intent !== undefined && isPath(options.intent)) {
+    throw new Error(`"${options.intent}" is not an intent name: it is a path.`);
+  }
   const delegated = delegatedWorktreeIntent(projectDir);
   if (delegated) {
     if ((options.space !== undefined && options.space !== delegated.space) ||
