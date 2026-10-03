@@ -7918,6 +7918,18 @@
     },
     {
       "unitClass": "function",
+      "unitId": "function:recordHookTrace",
+      "minMechanism": "none",
+      "coveredBy": [
+        {
+          "file": "tests/unit/t37.test.ts",
+          "mechanism": "cli"
+        }
+      ],
+      "status": "covered"
+    },
+    {
+      "unitClass": "function",
       "unitId": "function:recordIntentKey",
       "minMechanism": "none",
       "coveredBy": [

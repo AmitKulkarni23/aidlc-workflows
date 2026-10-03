@@ -164,6 +164,7 @@ import {
   readSessionIntentHandoff,
   readSessionIntentUuid,
   recordHookDrop,
+  recordHookTrace,
   resolveProjectDirFromHook,
   resolveWorkflowSelection,
   stageDir,
@@ -841,7 +842,7 @@ function isPendingComposeStop(projectDir: string, stateContent: string): boolean
       // Unlink failure is non-fatal - the staleness check above already refused
       // to honour the marker, so the loop stays enforced regardless.
     }
-    recordHookDrop(
+    recordHookTrace(
       projectDir,
       HOOK_NAME,
       "ignoring an orphaned compose marker (aidlc/.aidlc-compose-pending older than the freshness window); cleaned it up and falling through to the cap-bounded block",
@@ -887,7 +888,7 @@ function isPendingSubagentStop(
       return false;
     }
     if (match.staleRemoved > 0) {
-      recordHookDrop(
+      recordHookTrace(
         projectDir,
         HOOK_NAME,
         `pruned ${match.staleRemoved} orphaned background-subagent in-flight ${match.staleRemoved === 1 ? "entry" : "entries"} before evaluating the pending-subagent carve-out`,
@@ -1669,7 +1670,7 @@ if (sessionId) {
     if (exactBoundary) {
       clearSessionIntentHandoff(projectDir, sessionId);
       resetGuard(projectDir);
-      recordHookDrop(
+      recordHookTrace(
         projectDir,
         HOOK_NAME,
         "allowing stop at the exact intent handoff boundary (create or switch)",
@@ -1704,7 +1705,7 @@ if (!copilotSession) {
     return allowStop();
   }
   if (resumeWaiting) {
-    recordHookDrop(
+    recordHookTrace(
       projectDir,
       HOOK_NAME,
       "active resume choice is waiting on the human; allowing the stop before the shared next probe",
@@ -1712,7 +1713,7 @@ if (!copilotSession) {
     return allowStop();
   }
   if (recoveryWaiting) {
-    recordHookDrop(
+    recordHookTrace(
       projectDir,
       HOOK_NAME,
       "active guard-recovery question is waiting on the human; allowing the stop before the shared next probe",
@@ -1781,7 +1782,7 @@ if (kind === "parked") {
     getField(stateContent, "Construction Autonomy Mode")?.trim() === "autonomous" &&
     getField(stateContent, "Parked By")?.trim() !== "person"
   ) {
-    recordHookDrop(
+    recordHookTrace(
       projectDir,
       HOOK_NAME,
       "parked directive seen under autonomous Construction; declining the parked allow (an unattended run must not self-park), falling through to the cap-bounded block",
@@ -1848,7 +1849,7 @@ if (kind === "error") {
     return allowStop();
   }
   if (delivery === "duplicate") {
-    recordHookDrop(
+    recordHookTrace(
       projectDir,
       HOOK_NAME,
       `error directive ${fingerprint} was already delivered; allowing stop`,
@@ -1889,7 +1890,7 @@ if (!KNOWN_DIRECTIVE_KINDS.has(kind)) {
 // current-stage-scoped successor to the broad `[?]` substring match that landed
 // in 679153d; scoping to the current slug and adding [R] is strictly safer.)
 if (isHumanWaitStop(projectDir, stateContent, activeStage, activeUnit)) {
-  recordHookDrop(
+  recordHookTrace(
     projectDir,
     HOOK_NAME,
     `current stage ${currentStageSlug(stateContent)} is awaiting approval or being revised; allowing the stop (human-wait carve-out)`,
@@ -1903,7 +1904,7 @@ if (isHumanWaitStop(projectDir, stateContent, activeStage, activeUnit)) {
 // unit-major walk. Strictly gated and fail-open (see isPendingQuestionStop).
 if (isPendingQuestionStop(projectDir, stateContent, activeStage, activeUnit)) {
   const pendingStage = activeStage ?? currentStageSlug(stateContent);
-  recordHookDrop(
+  recordHookTrace(
     projectDir,
     HOOK_NAME,
     `active stage ${pendingStage} has an unanswered question; allowing the stop (pending-question carve-out)`,
@@ -1924,7 +1925,7 @@ if (isPendingDecisionStop(projectDir, stateContent, activeStage, activeUnit)) {
   const pendingStage = teamPending
     ? (activeStage ?? currentStageSlug(stateContent))
     : currentStageSlug(stateContent);
-  recordHookDrop(
+  recordHookTrace(
     projectDir,
     HOOK_NAME,
     teamPending
@@ -1941,7 +1942,7 @@ if (isPendingDecisionStop(projectDir, stateContent, activeStage, activeUnit)) {
 // nudging it back into stage execution mid-compose. Positive-confirmation only
 // (the marker), autonomy-guarded, fail-open (see isPendingComposeStop).
 if (isPendingComposeStop(projectDir, stateContent)) {
-  recordHookDrop(
+  recordHookTrace(
     projectDir,
     HOOK_NAME,
     "an in-flight compose proposal is pending human approval (aidlc/.aidlc-compose-pending present); allowing the stop (pending-compose carve-out)",
@@ -1955,7 +1956,7 @@ if (isPendingComposeStop(projectDir, stateContent)) {
 // autonomy-guarded, freshness-bounded, and fail-open (see
 // isPendingSubagentStop).
 if (isPendingSubagentStop(projectDir, stateContent, rawSessionId)) {
-  recordHookDrop(
+  recordHookTrace(
     projectDir,
     HOOK_NAME,
     "a background subagent is still in flight for this session; allowing the stop (pending-subagent carve-out)",
@@ -1975,7 +1976,7 @@ if (isPendingSubagentStop(projectDir, stateContent, rawSessionId)) {
 // so a conductor that engaged the workflow and then quit mid-loop (and every
 // autonomous run) is still nudged.
 if (isConversationalStop(projectDir, stateContent, transcriptPath, transcriptFormat, copilotSession)) {
-  recordHookDrop(
+  recordHookTrace(
     projectDir,
     HOOK_NAME,
     "the ending turn was conversational (human's last prompt answered with no workflow-engine call); allowing the stop (conversational carve-out)",

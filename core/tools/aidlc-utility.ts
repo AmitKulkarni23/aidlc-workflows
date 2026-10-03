@@ -3277,6 +3277,75 @@ export function firingHooksLastFired(projectDir: string, now = Date.now()): stri
     : undefined;
 }
 
+// A hook failure this recent is a doctor warning; an older one is history.
+const HOOK_FAILURE_RECENT_MS = 24 * 60 * 60 * 1000;
+
+// Before the Stop hook wrote its normal waits to continue-workflow.trace it
+// wrote them to its .drops file, each carrying one of these fixed fragments,
+// which none of its failure reasons carries. A record upgraded mid-workflow
+// keeps those lines, so doctor skips them rather than report them as failures.
+const LEGACY_STOP_HOOK_TRACE_FRAGMENTS = [
+  "is waiting on the human; allowing the stop before the shared next probe",
+  "at the exact post-create fresh-session handoff boundary",
+  "at the exact intent handoff boundary (create or switch)",
+  "was already delivered; allowing stop",
+  "before evaluating the pending-subagent carve-out",
+  "cleaned it up and falling through to the cap-bounded block",
+  "declining the parked allow",
+];
+
+function legacyStopHookTraceLine(hook: string, line: string): boolean {
+  if (hook !== "continue-workflow") return false;
+  const trimmed = line.trimEnd();
+  return trimmed.endsWith(" carve-out)") ||
+    LEGACY_STOP_HOOK_TRACE_FRAGMENTS.some((fragment) => trimmed.includes(fragment));
+}
+
+// A drop reason as doctor shows it: only its summary, the text before the
+// first ": ". Hooks put outside text (an error's detail, captured stderr, a
+// tool result) after that separator, and so do Node and Bun error messages
+// ("ENOENT: no such file or directory, open '<path>'"), so the detail stays in
+// the machine-local .drops file the row tells the person to read. The summary
+// is still redacted, control characters become spaces, and a double quote
+// becomes a single one so the quotes doctor puts around it mark where it ends.
+function shownHookReason(reason: string, max: number): string {
+  const cut = reason.indexOf(": ");
+  const summary = cut === -1 ? reason : reason.slice(0, cut);
+  return redactSecretPatterns(summary).replace(/\p{Cc}/gu, " ").replaceAll('"', "'").trim().slice(0, max);
+}
+
+// The plugin compose hook tags a benign, expected drop with a leading
+// `[advisory]` on its reason; such a line is never a recent failure.
+function advisoryHookDropLine(line: string): boolean {
+  return line.split("\t").slice(1).join(" ").trimStart().startsWith("[advisory]");
+}
+
+// A drop line's timestamp (its first TAB field), or NaN for a torn line.
+function hookDropStamp(line: string): number {
+  const token = line.split("\t")[0].trim();
+  return /^\d{4}-\d{2}-\d{2}T[\d:.]+Z?$/.test(token) ? Date.parse(token) : Number.NaN;
+}
+
+// One hook's doctor entry: how many failures, the last one's time, and its
+// most frequent reason summaries, newest first among equals. Only a timestamp-shaped
+// token is shown as the time: the newest line is the likeliest to be torn.
+function hookDropEntry(hook: string, lines: readonly string[]): string {
+  const lastToken = lines[lines.length - 1].split("\t")[0].trim();
+  const lastTs = Number.isFinite(hookDropStamp(lines[lines.length - 1])) ? lastToken : "unparseable line";
+  const counts = new Map<string, { count: number; newest: number }>();
+  lines.forEach((line, index) => {
+    const reason = shownHookReason(line.split("\t").slice(1).join(" "), 120);
+    if (reason.length === 0) return;
+    const seen = counts.get(reason);
+    counts.set(reason, { count: (seen?.count ?? 0) + 1, newest: index });
+  });
+  const top = [...counts.entries()]
+    .sort(([, a], [, b]) => b.count - a.count || b.newest - a.newest)
+    .slice(0, 3)
+    .map(([reason, { count }]) => `${count}x "${reason}"`);
+  return `${hook} x${lines.length} (last ${lastTs})${top.length > 0 ? `, top reasons: ${top.join(", ")}` : ""}`;
+}
+
 export async function collectDoctorReport(
   projectDir: string,
   extraChecks: readonly DoctorCheck[] = [],
@@ -4632,34 +4701,50 @@ export async function collectDoctorReport(
   // first token is shown, else a placeholder. Unlike the sibling probes this
   // one does NOT absorb read errors into the clean row: EACCES is exactly the
   // environment that produces drops, so an unreadable dir/file is named
-  // rather than reported "none recorded".
+  // rather than reported "none recorded". Each hook's entry counts every
+  // failure and names its most frequent reason summaries, and a hook whose
+  // latest failure is under a day old (or whose newest line is torn in a file
+  // written that recently) is a warning; an `[advisory]` line never counts as
+  // a recent failure, so the person who runs doctor because
+  // something went wrong today sees it without --verbose; it clears itself a
+  // day later or when the file is deleted. A hook's normal decisions are in its
+  // .trace file, never counted.
   const advisoryEntries: string[] = [];
+  const recentEntries: string[] = [];
+  const recentFiles: string[] = [];
+  const recentSinceMs = Date.now() - HOOK_FAILURE_RECENT_MS;
   let dropsUnreadable = 0;
   if (heartbeatDirExists) {
     try {
       const dropFiles = readdirSync(healthDir).filter((f) => f.endsWith(".drops"));
       for (const f of dropFiles) {
         try {
+          const hook = f.replace(".drops", "");
           const lines = readFileSync(join(healthDir, f), "utf-8")
             .split("\n")
-            .filter((l) => l.trim().length > 0);
+            .filter((l) => l.trim().length > 0 && !legacyStopHookTraceLine(hook, l));
           if (lines.length === 0) continue;
-          const hook = f.replace(".drops", "");
           const reasons = lines.map((l) => l.split("\t").slice(1).join(" "));
           const degraded = reasons.filter((r) => r.includes("[degraded]"));
           if (degraded.length > 0) {
-            const last = reasons[reasons.length - 1].slice(0, 160);
+            const last = shownHookReason(reasons[reasons.length - 1], 160);
             results.push({
               pass: false,
               label: `Hook drops (${hook}): ${degraded.length} degraded of ${lines.length}`,
               fix: `${hook} degraded silently - read ${join(healthDir, f)} (latest: ${last}); fix the cause and re-compose (the file self-clears on a clean run)`,
             });
           } else {
-            const lastToken = lines[lines.length - 1].split("\t")[0].trim();
-            const lastTs = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z?$/.test(lastToken)
-              ? lastToken
-              : "unparseable line";
-            advisoryEntries.push(`${hook} x${lines.length} (last ${lastTs})`);
+            const dropFile = join(healthDir, f);
+            const newest = lines[lines.length - 1];
+            const newestTorn = !Number.isFinite(hookDropStamp(newest)) && !advisoryHookDropLine(newest);
+            const recent = lines.some((line) => !advisoryHookDropLine(line) && hookDropStamp(line) >= recentSinceMs) ||
+              (newestTorn && statSync(dropFile).mtimeMs >= recentSinceMs);
+            if (recent) {
+              recentEntries.push(hookDropEntry(hook, lines));
+              recentFiles.push(dropFile);
+            } else {
+              advisoryEntries.push(hookDropEntry(hook, lines));
+            }
           }
         } catch {
           dropsUnreadable++;
@@ -4675,17 +4760,28 @@ export async function collectDoctorReport(
       label:
         dropsUnreadable === -1
           ? "Hook drops: health dir unreadable (advisory) - check permissions on .aidlc-engine/hooks-health/"
-          : `Hook drops: ${dropsUnreadable} .drops file(s) unreadable (advisory)${advisoryEntries.length > 0 ? `; readable: ${advisoryEntries.join(", ")}` : ""} - check permissions on .aidlc-engine/hooks-health/`,
+          : `Hook drops: ${dropsUnreadable} .drops file(s) unreadable (advisory)${advisoryEntries.length > 0 ? `; readable: ${advisoryEntries.join("; ")}` : ""} - check permissions on .aidlc-engine/hooks-health/`,
     });
   } else if (advisoryEntries.length > 0) {
     results.push({
       pass: true,
-      label: `Hook drops recorded (advisory): ${advisoryEntries.join(", ")} - a hook swallowed a failure and fail-opened; inspect the named .drops file(s) under .aidlc-engine/hooks-health/ for the reasons, then delete them once investigated`,
+      label: `Hook drops recorded (advisory): ${advisoryEntries.join("; ")} - a hook recorded something it could not report at the time and carried on; read the named .drops file(s) under .aidlc-engine/hooks-health/ for the detail, then delete them once investigated`,
     });
-  } else {
+  } else if (recentEntries.length === 0) {
     results.push({
       pass: true,
       label: "Hook drops: none recorded",
+    });
+  }
+  if (recentEntries.length > 0) {
+    results.push({
+      pass: false,
+      severity: "warn",
+      label: `Hook failures, the latest within the last day: ${recentEntries.join("; ")}`,
+      fix:
+        "a hook hit a failure it could not report at the time and carried on. Read " +
+        `${recentFiles.join(", ")} for every line and fix the cause; this warning clears 24 hours ` +
+        `after the latest failure, or when you delete ${recentFiles.length === 1 ? "the file" : "the files"}`,
     });
   }
 
