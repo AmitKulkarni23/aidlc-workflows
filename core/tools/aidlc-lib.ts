@@ -366,7 +366,7 @@ export interface DocumentExtractorSpec {
   timeoutMs?: number;
 }
 
-/** A harness's advice for a host that runs no project hooks until the person acts. */
+/** A harness's advice for a host that runs no project hooks until the person acts (trust, reload, engine). */
 export interface HookActivation {
   recovery: string;
   missedReply: string;
@@ -25709,7 +25709,10 @@ export function unattendedHumanPresenceHint(): string {
       "as a human reply. Unset AIDLC_UNATTENDED before returning to interactive " +
       "mode, then submit a new human response.";
   // On a host that runs no hooks until the person acts, a reply they did send
-  // was never recorded, so the harness's own steps follow.
+  // was never recorded, so the harness's own steps follow. They follow every
+  // such refusal: nothing on record tells a reply not sent yet from one the
+  // prompt hook failed to record, and the steps open with "If the person
+  // already replied".
   const missedReply = humanTurnMintAllowed() ? hookActivation()?.missedReply : undefined;
   return `${unattended} This needs a fresh human turn: wait for the person to reply, then record it again.${
     missedReply ? ` ${missedReply}` : ""
