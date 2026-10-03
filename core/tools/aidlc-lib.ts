@@ -31784,6 +31784,35 @@ export function agentsDir(): string {
 
 let _agents: AgentMetadata[] | null = null;
 
+const AIDLC_AGENT_KEYS = ["display_name", "examples", "tier", "plugin"] as const;
+
+export function aidlcAgentClaim(path: string): string | null {
+  if (basename(path).startsWith("aidlc-")) return "its name starts with aidlc-";
+  let body: string;
+  try {
+    body = readFileSync(path, "utf-8");
+  } catch {
+    return null;
+  }
+  const fm = frontmatterBlock(body.replace(/^\uFEFF/, ""));
+  if (fm === null) return null;
+  const key = AIDLC_AGENT_KEYS.find((candidate) => new RegExp(`^${candidate}:`, "m").test(fm));
+  return key ? `it declares \`${key}:\`` : null;
+}
+
+export function isAidlcAgentFile(path: string): boolean {
+  return aidlcAgentClaim(path) !== null;
+}
+
+export function foreignAgentFiles(dir: string = agentsDir()): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.name.endsWith(".md") && entry.name !== "aidlc.md" && !entry.isDirectory())
+    .map((entry) => join(dir, entry.name))
+    .sort()
+    .filter((path) => !isAidlcAgentFile(path));
+}
+
 export function loadAgents(): AgentMetadata[] {
   if (!_agents) {
     const dir = agentsDir();
@@ -31794,6 +31823,7 @@ export function loadAgents(): AgentMetadata[] {
       .sort();
     for (const f of files) {
       const filePath = join(dir, f);
+      if (!isAidlcAgentFile(filePath)) continue;
       const agent = parseAgentFrontmatter(filePath);
       const previousFile = slugToFile.get(agent.slug);
       if (previousFile) {
@@ -31815,8 +31845,10 @@ export function _resetAgentsForTests(): void {
 
 function parseAgentFrontmatter(path: string): AgentMetadata {
   const body = readFileSync(path, "utf-8");
+  const claim = basename(path).startsWith("aidlc-") ? null : aidlcAgentClaim(path);
+  const because = claim ? ` (treated as an AI-DLC persona because ${claim})` : "";
   const fm = frontmatterBlock(body);
-  if (fm === null) throw new Error(`Agent file missing frontmatter: ${path}`);
+  if (fm === null) throw new Error(`Agent file missing frontmatter: ${path}${because}`);
 
   const slug = scalarField(fm, "name");
   const display_name = scalarField(fm, "display_name");
@@ -31827,7 +31859,7 @@ function parseAgentFrontmatter(path: string): AgentMetadata {
   if (!display_name) missing.push("display_name");
   if (missing.length > 0) {
     throw new Error(
-      `Agent file ${path} missing required frontmatter: ${missing.join(", ")}`
+      `Agent file ${path} missing required frontmatter: ${missing.join(", ")}${because}`
     );
   }
   return { slug, display_name, examples };
