@@ -25799,21 +25799,20 @@ export function humanTurnMintAllowed(): boolean {
 }
 
 export function unattendedHumanPresenceHint(): string {
-  // Explain unattended submissions when relevant, then require a human reply.
-  const unattended = humanTurnMintAllowed()
-    ? ""
-    : " AIDLC_UNATTENDED=1 is set, so automated prompt submissions cannot count " +
+  // Explain unattended submissions when relevant.
+  if (!humanTurnMintAllowed()) {
+    return " AIDLC_UNATTENDED=1 is set, so automated prompt submissions cannot count " +
       "as a human reply. Unset AIDLC_UNATTENDED before returning to interactive " +
       "mode, then submit a new human response.";
-  // On a host that runs no hooks until the person acts, a reply they did send
-  // was never recorded, so the harness's own steps follow. They follow every
-  // such refusal: nothing on record tells a reply not sent yet from one the
-  // prompt hook failed to record, and the steps open with "If the person
-  // already replied".
-  const missedReply = humanTurnMintAllowed() ? hookActivation()?.missedReply : undefined;
-  return `${unattended} This needs a fresh human turn: wait for the person to reply, then record it again.${
-    missedReply ? ` ${missedReply}` : ""
-  }`;
+  }
+  // Nothing on record tells a reply not sent yet from one the prompt hook
+  // failed to record, so every such refusal also says what happened to a reply
+  // the person did send, and never asks them to send it again. A host that runs
+  // no hooks until the person acts names its own steps; the others name doctor.
+  const missedReply = hookActivation()?.missedReply ??
+    "If the person already replied, that reply was not recorded for this question. Tell them " +
+      `that, and that ${entrySkillInvocation()} --doctor shows whether AI-DLC's hooks run here.`;
+  return ` ${missedReply}`;
 }
 
 export function setField(content: string, field: string, value: string): string {
@@ -34791,7 +34790,7 @@ export function recordAcceptedChanges(
         throw new Error(
           `Cannot continue under a relaxed or off Guard Policy: the accepted change for "${change.stage}"` +
             `${change.unit ? ` (unit ${change.unit})` : ""} could not be recorded in the audit ledger ` +
-            `(${errorMessage(error)}). Repair the ledger, or approve again.`,
+            `(${errorMessage(error)}). Repair the ledger, then run the same command again.`,
         );
       }
       notices.push(change.notice);
