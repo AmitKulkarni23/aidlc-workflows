@@ -16,6 +16,8 @@ import { delimiter, dirname, extname, join, relative, resolve } from "node:path"
 import {
   assertProjectionPathHasNoSymlinks,
   isSafeOnboardingPath,
+  jsoncRootMembers,
+  jsoncSettingValue,
   sha256Bytes,
 } from "./aidlc-distribution.ts";
 import {
@@ -904,7 +906,9 @@ export function probeHarnessCli(
   const run = options.run ?? defaultRun;
   const result = run(path, ["--version"]);
   const version = result.stdout.trim();
-  if (result.status !== 0) {
+  // A floor needs a version: a reply with none is a stand-in, not the CLI.
+  // VS Code's `copilot` prints "Cannot find GitHub Copilot CLI" and exits 0 (#1411).
+  if (result.status !== 0 || (spec.minimumVersion && !versionTuple(version))) {
     return {
       harness,
       command: spec.command,
@@ -2778,10 +2782,12 @@ export function runtimeDoctorChecks(
     };
   });
   const cli = diagnostics.cli;
+  // Never a fail: a missing or old required CLI warns, and an optional one
+  // passes when absent and warns only when present but too old.
   checks.push({
     pass: cli.status === "found" || cli.status === "not-applicable" ||
       (!cli.required && cli.status === "missing"),
-    ...(cli.required && (cli.status === "missing" || cli.status === "too-old")
+    ...(cli.status === "too-old" || (cli.required && cli.status === "missing")
       ? { severity: "warn" as const }
       : {}),
     label: cli.status === "found"
@@ -2789,13 +2795,160 @@ export function runtimeDoctorChecks(
       : cli.status === "not-applicable"
       ? `Harness CLI: none required for ${cli.harness}`
       : cli.status === "too-old"
-      ? `Harness CLI: ${cli.command} ${cli.version || "unknown"} is below ${cli.minimumVersion}`
+      ? `Harness CLI: ${cli.required ? "" : "optional "}${cli.command} ${cli.version || "unknown"} is below ${cli.minimumVersion}`
       : cli.required
       ? `Harness CLI: ${cli.command} is missing`
       : `Harness CLI: optional ${cli.command} is not installed`,
     fix: cli.remediation,
   });
   return checks;
+}
+
+// VS Code pauses agent mode after `chat.agent.maxRequests` requests in one
+// turn to ask "Continue to iterate?", and the chat waits silently until
+// someone answers. Its default (50) stops a Construction stage part way, so a
+// Copilot project should allow 100 or more; config adds 200 when unset (#1411).
+const VSCODE_REQUEST_CAP_KEY = "chat.agent.maxRequests";
+const VSCODE_REQUEST_CAP_FLOOR = 100;
+
+export function vscodeRequestCapDoctorCheck(
+  projectDir: string,
+  harnessDirHint?: string,
+): DiagnosticDoctorCheck | null {
+  const selected = selectedHarness(projectDir, harnessDirHint);
+  if (selected?.harness !== "copilot") return null;
+  const label = "VS Code agent request cap:";
+  const where = ".vscode/settings.json";
+  let text: string | null = null;
+  try {
+    text = readFileSync(join(projectDir, ".vscode", "settings.json"), "utf-8");
+  } catch {
+    // Absent: VS Code's default applies.
+  }
+  if (text?.trim() && !jsoncRootMembers(text)) {
+    return {
+      pass: false,
+      severity: "warn",
+      label: `${label} ${where} could not be read as JSONC`,
+      fix: `correct ${where}, then set "${VSCODE_REQUEST_CAP_KEY}" to 100 or more (AI-DLC suggests 200); ${REQUEST_CAP_PAUSES}`,
+    };
+  }
+  const value = text?.trim() ? jsoncSettingValue(text, VSCODE_REQUEST_CAP_KEY) : undefined;
+  // A key AI-DLC added once and the team then took out of a file it kept is
+  // the team's choice: config does not add it back, and doctor does not ask.
+  if (value === undefined && text !== null && requestCapAddedBefore(selected.root)) {
+    return { pass: true, label: `${label} the team removed ${VSCODE_REQUEST_CAP_KEY} from ${where}, so AI-DLC leaves it out` };
+  }
+  return requestCapRow(label, where, value);
+}
+
+// A multi-root window reads window-scoped settings from its .code-workspace
+// file instead of a folder's .vscode/settings.json, so when the project has
+// the multi-root file workspace-sync generates, doctor checks it as well: it
+// is the file in charge whenever the person opens that workspace.
+export function vscodeWorkspaceRequestCapDoctorCheck(
+  projectDir: string,
+  harnessDirHint?: string,
+): DiagnosticDoctorCheck | null {
+  const selected = selectedHarness(projectDir, harnessDirHint);
+  if (selected?.harness !== "copilot") return null;
+  const label = "VS Code agent request cap (multi-root workspace):";
+  const where = "aidlc.code-workspace";
+  let text: string;
+  try {
+    text = readFileSync(join(projectDir, where), "utf-8");
+  } catch {
+    return null;
+  }
+  if (!jsoncRootMembers(text)) {
+    return {
+      pass: false,
+      severity: "warn",
+      label: `${label} ${where} could not be read as JSONC`,
+      fix: `correct ${where}, then set "${VSCODE_REQUEST_CAP_KEY}" to 100 or more in its "settings" (AI-DLC suggests 200); ${REQUEST_CAP_PAUSES}`,
+    };
+  }
+  const settings = jsoncSettingValue(text, "settings");
+  if (settings === undefined) {
+    return {
+      pass: false,
+      severity: "warn",
+      label: `${label} ${where} has no settings, so a window opened from it uses your user setting or VS Code's default of 50`,
+      fix: `run aidlc system workspace-sync, which adds "settings": { "${VSCODE_REQUEST_CAP_KEY}": 200 } to ${where}, or add it yourself; ${REQUEST_CAP_PAUSES}`,
+    };
+  }
+  if (settings === null || typeof settings !== "object" || Array.isArray(settings)) {
+    return {
+      pass: false,
+      severity: "warn",
+      label: `${label} "settings" in ${where} is not an object, so VS Code reads no settings from it`,
+      fix: `make "settings" an object, for example "settings": { "${VSCODE_REQUEST_CAP_KEY}": 200 }; ${REQUEST_CAP_PAUSES}`,
+    };
+  }
+  const value = (settings as Record<string, unknown>)[VSCODE_REQUEST_CAP_KEY];
+  // workspace-sync adds the key only to a file with no settings yet, so a
+  // settings object without it is the team's choice.
+  if (value === undefined) {
+    return { pass: true, label: `${label} the team's settings in ${where} leave out ${VSCODE_REQUEST_CAP_KEY}, so AI-DLC leaves it out` };
+  }
+  return requestCapRow(label, where, value);
+}
+
+const REQUEST_CAP_PAUSES = 'below 100, VS Code stops a long stage to ask "Continue to iterate?" and the chat waits until someone answers';
+
+// The install's added-once record for .vscode/settings.json.
+function requestCapAddedBefore(harnessRoot: string): boolean {
+  try {
+    const baseline = JSON.parse(readFileSync(join(harnessRoot, "tools", "data", "aidlc-manifest.json"), "utf-8")) as {
+      rootContributions?: Record<string, { policy?: string; entries?: Record<string, string>; added?: string[] }>;
+    };
+    const record = baseline.rootContributions?.[".vscode/settings.json"];
+    return record?.policy === "jsonc-settings" &&
+      (record.added?.includes(VSCODE_REQUEST_CAP_KEY) === true || Object.hasOwn(record.entries ?? {}, VSCODE_REQUEST_CAP_KEY));
+  } catch {
+    return false;
+  }
+}
+
+function requestCapRow(label: string, where: string, value: unknown): DiagnosticDoctorCheck {
+  const pauses = REQUEST_CAP_PAUSES;
+  const suggested = `"${VSCODE_REQUEST_CAP_KEY}": 200`;
+  const warn = (detail: string, fix: string): DiagnosticDoctorCheck => ({
+    pass: false,
+    severity: "warn",
+    label: `${label} ${detail}`,
+    fix,
+  });
+  if (typeof value === "number" && value >= VSCODE_REQUEST_CAP_FLOOR) {
+    return { pass: true, label: `${label} ${VSCODE_REQUEST_CAP_KEY} is ${value} in ${where}` };
+  }
+  // Every fix is an edit to the file itself, which works on every channel: a
+  // copied project's runtime ships no settings file for config to merge.
+  if (value === undefined) {
+    return warn(
+      `${where} does not set ${VSCODE_REQUEST_CAP_KEY}, so your user setting or VS Code's default of 50 applies`,
+      `add ${suggested} to ${where} (any number of 100 or more works); ${pauses}`,
+    );
+  }
+  if (typeof value === "number") {
+    return warn(
+      `${VSCODE_REQUEST_CAP_KEY} is ${value} in ${where}`,
+      `raise "${VSCODE_REQUEST_CAP_KEY}" in ${where} to 100 or more (AI-DLC suggests 200); ${pauses}`,
+    );
+  }
+  if (typeof value === "string" && /^\s*\d+(?:\.\d+)?\s*$/.test(value)) {
+    const number = Number(value.trim());
+    return warn(
+      `${VSCODE_REQUEST_CAP_KEY} is ${JSON.stringify(value)} in ${where}, text rather than a number`,
+      number >= VSCODE_REQUEST_CAP_FLOOR
+        ? `write it as a number without quotes: "${VSCODE_REQUEST_CAP_KEY}": ${number}, because VS Code reads this setting as a number`
+        : `write it as a number of 100 or more without quotes, for example ${suggested}; ${pauses}`,
+    );
+  }
+  return warn(
+    `${VSCODE_REQUEST_CAP_KEY} in ${where} is not a number`,
+    `set it to a number of 100 or more, for example ${suggested}; ${pauses}`,
+  );
 }
 
 export function providerDoctorCheck(
@@ -2852,7 +3005,8 @@ export function providerDoctorCheck(
       label: "Providers: could not read recorded answers",
       fix:
         `restore ${path} from git or re-copy dist/${selected.harness}/${selected.harnessDir}/tools/data/harness.json ` +
-        `from the aidlc-workflows checkout, then run \`${invocationForHarness(selected.harnessDir)} doctor\` ` +
+        // Not the doctor command itself: VS Code drops output up to a line that repeats it (#1411).
+        "from the aidlc-workflows checkout, then run doctor again " +
         `(${error instanceof Error ? error.message : String(error)})`,
     };
   }
