@@ -14152,7 +14152,7 @@ export function validateReviewAppendix(
     reviewChallenge: string | null;
     standalone?: boolean;
   },
-): { valid: true } | { valid: false; reason: string } {
+): { valid: true } | { valid: false; reason: string; heading?: true } {
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(appendix);
@@ -14179,6 +14179,7 @@ export function validateReviewAppendix(
   if (authority.markdownH1H2) {
     return {
       valid: false,
+      heading: true,
       reason:
         "the reviewer appendix must be terminal and contain no later rendered H1 or H2 heading",
     };
@@ -14186,6 +14187,7 @@ export function validateReviewAppendix(
   if (authority.htmlH1H2) {
     return {
       valid: false,
+      heading: true,
       reason:
         "the reviewer appendix must be terminal and contain no rendered HTML H1 or H2 heading",
     };
