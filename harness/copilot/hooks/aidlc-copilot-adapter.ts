@@ -515,9 +515,10 @@ export async function run(
   }
 
   // "terminal": a simple AI-DLC command that is not claimed as coordination
-  // (a read-only `next` form or another AI-DLC project command).
+  // (a read-only `next` form or another AI-DLC project command). "attempt": a
+  // new call that already carries the attempt flag AI-DLC adds itself.
   type ParsedOrchestration =
-    | { status: "unrelated" | "unsupported" | "foreign" | "terminal" }
+    | { status: "unrelated" | "unsupported" | "foreign" | "terminal" | "attempt" }
     | { status: "recognized"; claim: CopilotCommandClaim; rewrite: (attemptId: string) => string; keepsPrompt: boolean };
 
   // Doctor also checks the machine and may refresh the update cache over the
@@ -862,7 +863,8 @@ export async function run(
     for (let i = 0; i < args.length; i++) {
       if (args[i] === ATTEMPT_FLAG) {
         const carried = args[++i];
-        if (target === "guard-tool-call" || !safeAttemptId(carried) || (attemptId && attemptId !== carried)) return { status: "unsupported" };
+        if (target === "guard-tool-call") return { status: "attempt" };
+        if (!safeAttemptId(carried) || (attemptId && attemptId !== carried)) return { status: "unsupported" };
         attemptId = carried;
         continue;
       }
@@ -1784,6 +1786,13 @@ export async function run(
         }
         if (command.status === "unsupported") {
           process.stdout.write(denyJson("Use one simple direct, source-dispatcher, or compiled AI-DLC command without chaining, substitution, or redirection other than one terminal `2>&1`."));
+          return 0;
+        }
+        if (command.status === "attempt") {
+          // An id copied from an earlier command. The text is fixed: the
+          // command is never echoed back or edited here, and the same command
+          // without the flag gets this call's own id.
+          process.stdout.write(denyJson(`AI-DLC adds \`${ATTEMPT_FLAG}\` to its own commands, so a command that already carries it did not run. Run the same command again without \`${ATTEMPT_FLAG}\` and the id after it.`));
           return 0;
         }
         // A guard that crashed still fails open, but AI-DLC then does not vouch

@@ -835,6 +835,41 @@ describe("t250 Copilot adapter security (fail-open + path confinement)", () => {
     }
   });
 
+  test("12b: a command that already carries AI-DLC's attempt id is refused for that, and the same command without it runs", () => {
+    // AI-DLC adds --aidlc-attempt-id to each workflow command itself, so an
+    // agent that copies one from an earlier command into a new call was told
+    // to avoid chaining and redirection it never used (#1411).
+    const s = scratch();
+    try {
+      seedAidlcScripts(s);
+      const guard = (command: string) => shellDecision(runAdapter(s, "guard-tool-call", shellCall(command)));
+      const copied = "--aidlc-attempt-id 11111111-1111-4111-8111-111111111111";
+      // The refusal is fixed text: the command is never echoed back or edited.
+      const refusal = "AI-DLC adds `--aidlc-attempt-id` to its own commands, so a command that already carries it did not run. " +
+        "Run the same command again without `--aidlc-attempt-id` and the id after it.";
+      for (const [command, retry] of [
+        [`aidlc engine orchestrate next ${copied}`, "aidlc engine orchestrate next"],
+        [`aidlc continue ABCD1234 ${copied}`, "aidlc continue ABCD1234"],
+        [`bun .aidlc/tools/aidlc-orchestrate.ts next ${copied} 2>&1`, "bun .aidlc/tools/aidlc-orchestrate.ts next 2>&1"],
+        [`aidlc engine orchestrate report --stage requirements-analysis --result completed ${copied}`, "aidlc engine orchestrate report --stage requirements-analysis --result completed"],
+        ["aidlc engine orchestrate next --aidlc-attempt-id", "aidlc engine orchestrate next"],
+        [`aidlc engine orchestrate report --stage requirements-analysis --result approved --user-input 'ok \`run this\`' ${copied}`,
+          "aidlc engine orchestrate report --stage requirements-analysis --result approved --user-input 'ok'"],
+      ]) {
+        const denied = guard(command);
+        expect(denied.hookSpecificOutput?.permissionDecision, command).toBe("deny");
+        expect(denied.hookSpecificOutput?.permissionDecisionReason, command).toBe(refusal);
+        expect(denied.hookSpecificOutput?.updatedInput, command).toBeUndefined();
+        // The same command without the flag is the next step, and it works.
+        const next = guard(retry);
+        expect(next.hookSpecificOutput?.permissionDecision, retry).toBe("allow");
+        expect(next.hookSpecificOutput?.updatedInput?.command, retry).toContain(STUB_ATTEMPT);
+      }
+    } finally {
+      s.cleanup();
+    }
+  });
+
   // --- Deliberate block (core exit 2) → deny projection, later hooks skipped --
 
   test("13: a core-hook exit 2 becomes a deny-JSON projection (exit 0); reviewer-scope is skipped", () => {
