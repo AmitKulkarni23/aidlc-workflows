@@ -147,6 +147,8 @@ import {
   profileGroups,
   readAgentTiers,
   resolveModelPolicy,
+  sessionModelsDetail,
+  sessionSetsAgentModels,
   type AgentTiers,
   type ModelEffort,
   type ModelGroup,
@@ -1380,13 +1382,19 @@ function diagnosticHelp(section: DiagnosticSection): string {
 
 // The projected descriptor's product name ("Kiro CLI", "Claude Code"), so a
 // prompt can name the harness the user is actually running; the distribution
-// id is the fallback when the descriptor is unreadable.
+// id is the fallback when the descriptor is unreadable. The descriptor is a
+// project file, so only a plain name reaches the terminal.
+const PLAIN_PRODUCT_NAME = /^[A-Za-z0-9][A-Za-z0-9 .+-]{0,39}$/;
+
 function projectionProductName(root: string, distribution: string): string {
   try {
     const value = JSON.parse(
       readFileSync(join(root, "tools", "data", "harness.json"), "utf-8"),
     ) as { productName?: unknown };
-    if (typeof value.productName === "string" && value.productName.trim()) {
+    if (
+      typeof value.productName === "string" &&
+      PLAIN_PRODUCT_NAME.test(value.productName)
+    ) {
       return value.productName;
     }
   } catch {
@@ -2215,8 +2223,13 @@ function setupMapRows(
   const providerManaged = !harnessOwnsModelAccess(modelHarness(distribution));
   const providerNeeds = providerManaged &&
     (providers.length > 0 || records.providers === null);
-  const modelsUnrecorded = !policy || modelPolicyIsEmpty(policy);
-  const modelDetail = modelsUnrecorded
+  // Where the session sets every agent, there is no policy to ask for: the
+  // row names the host's session as the lever and is never walked.
+  const sessionSet = sessionSetsAgentModels(modelHarness(distribution));
+  const modelsUnrecorded = !sessionSet && (!policy || modelPolicyIsEmpty(policy));
+  const modelDetail = sessionSet
+    ? sessionModelsDetail(modelHarness(distribution), policy)
+    : !policy || modelPolicyIsEmpty(policy)
     ? "no recorded policy; agents inherit your session model and effort"
     : policy.preset
     ? `preset ${policy.preset}`
@@ -2400,7 +2413,10 @@ function setupLedgerActions(
   actions: readonly ConfigOutstandingAction[],
 ): ConfigOutstandingAction[] {
   const next = [...actions];
-  if (!next.some((action) => action.section === "models")) {
+  if (
+    !sessionSetsAgentModels(harness) &&
+    !next.some((action) => action.section === "models")
+  ) {
     const resolved = resolveAidlcSettings(projectDir);
     const policy = modelPolicyForHarness(resolved.models, harness);
     if (!policy || modelPolicyIsEmpty(policy)) {
