@@ -96,6 +96,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
+  hookOutsideGate,
+  enterHookWorkflow,
   classifyTerminalCommand,
   decodeHarnessPlainText,
   fenceCommandOutput,
@@ -105,17 +107,15 @@ import {
   getField,
   hookChildEnv,
   hookDebug,
-  hooksHealthDir,
   humanActedSinceGate,
   humanPresenceGuardDisabled,
   isAutonomousMode,
   isSwitchableGuardFence,
-  isoTimestamp,
   kiroIdeLegacyPlanApprovalSessionId,
   markKiroIdeLegacyPlanApprovalHost,
   clearPlanApprovalLegacyWindow,
-  recordDir,
   recordHookDrop,
+  recordPreWorkflowHeartbeat,
   readPlanApprovalViolation,
   readPlanApprovalLegacyWindow,
   readPlanApprovalLegacyWindows,
@@ -173,6 +173,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // payload acquisition entirely and keeps its zero-latency path.
 const PAYLOAD_TARGETS = new Set([
   "audit-and-sensors",
+  // The approval gate reads the payload session: concurrent chats in one IDE
+  // process each have their own workflow and gate.
+  "enforce-approval-gate",
   "log-subagent",
   "plan-approval-guard",
   "rebuild-stage-graph",
@@ -389,6 +392,21 @@ function resolvedPlanApprovalSessionId(ide: IdeHookContext): string {
   } catch {
     return LEGACY_SESSION_ID;
   }
+}
+
+// Whether this conversation stands outside the workflow the default resolution
+// selects: that workflow's gates and local Plan Approval latches do not hold it.
+let standsOutsideMemo: boolean | undefined;
+function ideStandsOutside(pd: string, sessionId: string): boolean {
+  if (standsOutsideMemo === undefined) {
+    const workflow = enterHookWorkflow(pd, sessionId);
+    try {
+      standsOutsideMemo = hookOutsideGate(workflow);
+    } finally {
+      workflow.restore();
+    }
+  }
+  return standsOutsideMemo;
 }
 
 function runLegacyRecoveryNext(
@@ -1255,23 +1273,6 @@ function rememberKiroIdeSessionId(sessionId: string): void {
   }
 }
 
-// Before the first workflow no core hook writes a heartbeat, so doctor could
-// not tell a folder nobody has chatted in from one whose hooks Kiro IDE is not
-// running (untrusted or not reloaded). A chat message leaves the heartbeat the
-// core hooks write, only while no intent record resolves: inside one,
-// heartbeats feed the Plan Approval staleness refusal (hookLiveness) and stay
-// the core hooks' own.
-function recordPromptHeartbeat(hook: string): void {
-  try {
-    if (recordDir(projectDir) !== null) return;
-    const healthDir = hooksHealthDir(projectDir);
-    mkdirSync(healthDir, { recursive: true });
-    writeFileSync(join(healthDir, `${hook}.last`), isoTimestamp(), "utf-8");
-  } catch {
-    // Advisory: without it doctor keeps its "not run yet" warning.
-  }
-}
-
 function rememberedKiroIdeSessionId(): string {
   try {
     const sessionId = readFileSync(
@@ -1530,21 +1531,23 @@ function notePromptCapability(sessionId: string): void {
   }
   process.stdout.write(
     "Guard settings cannot be lowered, and summary confirmation and plan approval cannot be turned off, for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. To use a lower guard setting, update Kiro IDE or start a new piece of work from a scope whose default already uses that setting. " +
-      `${summaryConfirmationWayOut()} ${PLAN_APPROVAL_WAY_OUT} You can still select strict or turn a fence on. An existing Change Control: relaxed|off line is renamed to Guard Policy without changing its value.\n`,
+      `${summaryConfirmationWayOut()} ${planApprovalWayOut()} You can still select strict or turn a fence on. An existing Change Control: relaxed|off line is renamed to Guard Policy without changing its value.\n`,
   );
 }
 
-// An updated build carries the typed switch again. The recorded kill switch is
-// the person's own terminal command, but config refuses it while any workflow
-// is still active, so it is named only as the route once the work is complete.
+// The step that works now comes first: the recorded kill switch is the
+// person's own terminal command, and recording it refreshes no project files,
+// so it also covers the work running now. An updated build carries the typed
+// switch again.
 function summaryConfirmationWayOut(): string {
-  return `To turn summary confirmation off, update Kiro IDE and type \`/aidlc config set summary-confirmation off\` yourself. Once every piece of work in this project is complete, you can instead run \`${aidlcInvocation()} config flags --bypass AIDLC_DISABLE_SUMMARY_CONFIRMATION --local --yes\` in a terminal to turn it off for all work in this project (run it again with \`--clear-bypass\` in place of \`--bypass\` to turn it back on).`;
+  return `To turn summary confirmation off now, run \`${aidlcInvocation()} config flags --bypass AIDLC_DISABLE_SUMMARY_CONFIRMATION --local --yes\` in a terminal: it turns it off for all work in this project, including the work running now (run it again with \`--clear-bypass\` in place of \`--bypass\` to turn it back on). After you update Kiro IDE, you can instead type \`/aidlc config set summary-confirmation off\` yourself.`;
 }
 
 // Plan approval off is read from what the person types or says, so this build
-// keeps asking about every plan; an update is what enables the switch.
-const PLAN_APPROVAL_WAY_OUT =
-  "To build code plans without being asked, update Kiro IDE and type `/aidlc config set plan-approval off` yourself.";
+// cannot carry the typed switch; the recorded one works now, as above.
+function planApprovalWayOut(): string {
+  return `To build code plans without being asked now, run \`${aidlcInvocation()} config flags --bypass AIDLC_DISABLE_PLAN_APPROVAL_GUARD --local --yes\` in a terminal: it turns plan approval off for all work in this project, including the work running now (run it again with \`--clear-bypass\` in place of \`--bypass\` to turn it back on). After you update Kiro IDE, you can instead type \`/aidlc config set plan-approval off\` yourself.`;
+}
 
 // "summary" when the only lowering is summary confirmation off, which skips
 // the person's `Looks correct` check; "plan" when it is plan approval off;
@@ -1688,7 +1691,7 @@ function terminalRefusal(result: TerminalResult): string {
 
 if (target === "verb-intercept") {
   // Before a doctor request below runs, so it sees this message.
-  recordPromptHeartbeat("terminal-command");
+  recordPreWorkflowHeartbeat(projectDir, "terminal-command");
   const sessionId = terminalSessionId();
   const turn = bumpTurn(sessionId);
   recordPromptEmpty(sessionId, turn);
@@ -1728,7 +1731,7 @@ if (target === "terminal-command-guard") {
     process.stderr.write(refused === "summary"
       ? `Summary confirmation cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${summaryConfirmationWayOut()}\n`
       : refused === "plan"
-      ? `Plan approval cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${PLAN_APPROVAL_WAY_OUT}\n`
+      ? `Plan approval cannot be turned off for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. ${planApprovalWayOut()}\n`
       : "Guard settings cannot be lowered for the active piece of work in this Kiro IDE session because this version does not provide the submitted message. Update Kiro IDE or start a new piece of work from a scope whose default already uses the lower setting. You can still select strict or turn a fence on.\n");
     return 2;
   }
@@ -1776,8 +1779,13 @@ if (target === "terminal-command-guard") {
 // off-switch. The IDE gives no cwd payload, so the project dir is process.cwd().
 // All read from disk. Fail-open on any read/parse error (advisory).
 function approvalGateAwaitsHuman(): boolean {
+  const pd = process.cwd();
+  // The payload session stays pinned for the whole check, so the gate state and
+  // the human-turn evidence come from the workflow this conversation selects,
+  // not the one the shared cursor or process ancestry names.
+  const workflow = enterHookWorkflow(pd, resolvedPlanApprovalSessionId(ide));
   try {
-    const pd = process.cwd();
+    if (hookOutsideGate(workflow)) return false;
     const sp = stateFilePath(pd);
     const content = existsSync(sp) ? readFileSync(sp, "utf-8") : null;
     // Carve-outs first: autonomous Construction, the deterministic off-switch,
@@ -1788,6 +1796,8 @@ function approvalGateAwaitsHuman(): boolean {
     return !humanActedSinceGate(pd); // a human acted at this gate
   } catch {
     return false; // advisory - any read/parse failure fails open
+  } finally {
+    workflow.restore();
   }
 }
 
@@ -1795,14 +1805,15 @@ if (target === "enforce-approval-gate") {
   if (approvalGateAwaitsHuman()) {
     const palette = process.platform === "darwin" ? "Cmd+Shift+P" : "Ctrl+Shift+P";
     process.stderr.write(
-      "An approval gate is open and no human has acted since it opened. The gate " +
-        "requires a typed human turn before any tool call proceeds. Acknowledge the " +
-        "gate as a human, then continue. If you already replied, Kiro may not be " +
-        "running AIDLC hooks in this window: trust the folder if the Restricted Mode " +
-        "banner shows at the top of the window (select Manage, then Trust), run " +
-        `"Developer: Reload Window" from the Command Palette (${palette}), and choose ` +
-        "the aidlc agent in the chat panel's agent picker, then reply again. In Kiro " +
-        "CLI, exit and start `kiro-cli` again in this folder, then reply again.\n",
+      "An approval gate is open and no reply from the person is on record since it " +
+        "opened, so no tool call runs until they answer it. If they already replied, " +
+        "that reply was not recorded: Kiro may not have passed it to AI-DLC's hooks in " +
+        "this window. Tell them that, and that trusting the folder if the Restricted Mode " +
+        "banner shows at the top of the window (select Manage, then Trust), running " +
+        `"Developer: Reload Window" from the Command Palette (${palette}), and choosing ` +
+        "the aidlc agent in the chat panel's agent picker should let their next message be " +
+        "recorded; if it still is not, `/aidlc --doctor` shows why. In Kiro CLI, starting " +
+        "`kiro-cli` again in this folder does the same.\n",
     );
     return 2; // Kiro reject contract: exit 2 + stderr BLOCKS the tool call.
   }
@@ -1896,6 +1907,10 @@ function inputPaths(input: Record<string, unknown>): string[] {
   add(input.path);
   add(input.file_path);
   add(input.filePath);
+  // `delete_file` names its target `targetFile` and carries no other path field
+  // (every captured payload is {explanation, targetFile}). Without it a delete
+  // had no target, so Plan Approval treated it as an opaque mutation.
+  add(input.targetFile);
   if (Array.isArray(input.paths)) for (const path of input.paths) add(path);
   if (Array.isArray(input.operations)) {
     for (const operation of input.operations) {
@@ -1941,7 +1956,7 @@ function buildForward(): Forward {
       "kiro-adapter",
       `${target}: malformed hook context fields (${ide.malformedFields?.join(", ")}) — event not forwarded`,
     );
-    if (target === "plan-approval-guard") {
+    if (target === "plan-approval-guard" && !ideStandsOutside(projectDir, resolvedPlanApprovalSessionId(ide))) {
       const malformedToolName = ide.toolName ?? "";
       if (
         readPlanApprovalLegacyWindows(projectDir).length > 0 &&
@@ -2003,7 +2018,7 @@ function buildForward(): Forward {
     }
 
     case "record-human-turn": {
-      recordPromptHeartbeat("record-human-turn");
+      recordPreWorkflowHeartbeat(projectDir, "record-human-turn");
       const eventSessionId = ide.sessionId?.trim();
       const sessionId = terminalSessionId();
       // Kiro IDE 1.1.14 runs no SessionStart hook when a chat starts, so a
@@ -2021,7 +2036,7 @@ function buildForward(): Forward {
       // never manufacture a current-session marker from the legacy fallback.
       if (eventSessionId) rememberKiroIdeSessionId(eventSessionId);
       recordPromptEmpty(sessionId, readTurn(sessionId) || bumpTurn(sessionId));
-      if (promptEmpty) {
+      if (promptEmpty && !ideStandsOutside(projectDir, resolvedPlanApprovalSessionId(ide))) {
         try {
           const migration = normalizeRetiredGuardPolicyField(projectDir, sessionId);
           if (migration.normalized) {
@@ -2079,7 +2094,8 @@ function buildForward(): Forward {
       const activeWriteWindows = readPlanApprovalLegacyWindows(projectDir);
       if (
         activeWriteWindows.length > 0 &&
-        (toolName === "" || mutationCapableTool(toolName))
+        (toolName === "" || mutationCapableTool(toolName)) &&
+        !ideStandsOutside(projectDir, resolvedPlanApprovalSessionId(ide))
       ) {
         let recoverySession = resolvedPlanApprovalSessionId(ide);
         try {
@@ -2123,7 +2139,7 @@ function buildForward(): Forward {
             )
           )
         );
-      if (opaqueMutation) {
+      if (opaqueMutation && !ideStandsOutside(projectDir, resolvedPlanApprovalSessionId(ide))) {
         const approvalSession = resolvedPlanApprovalSessionId(ide);
         const state = legacyPlanApprovalGuardState(projectDir);
         const writeWindows = readPlanApprovalLegacyWindows(projectDir);
@@ -2417,7 +2433,7 @@ function buildForward(): Forward {
         // during Code Generation, refuse it before any stage is decided. Outside
         // that stage the core guard allows every dispatch, so the pipeline goes
         // through as it would without AI-DLC.
-        if (developers.length > 1 && codeGenerationIsCurrent(projectDir)) {
+        if (developers.length > 1 && codeGenerationIsCurrent(projectDir) && !ideStandsOutside(projectDir, resolvedPlanApprovalSessionId(ide))) {
           return {
             hook: "__legacy_plan_approval_block__",
             input: {
@@ -2567,6 +2583,7 @@ function buildForward(): Forward {
         hook: "__audit_and_sensors__", // handled specially below (two hooks)
         input: {
           hook_event_name: "PostToolUse",
+          session_id: ide.sessionId?.trim() || rememberedKiroIdeSessionId(),
           tool_name: canon,
           tool_input: { file_path: filePath },
         },
@@ -2601,6 +2618,7 @@ function buildForward(): Forward {
         hook: "aidlc-sync-workflow-state.ts",
         input: {
           hook_event_name: "PostToolUse",
+          session_id: ide.sessionId?.trim() || rememberedKiroIdeSessionId(),
           tool_name: "TaskUpdate",
           tool_input: { source: "ide-audit-sync" },
         },
@@ -2727,8 +2745,8 @@ function buildForward(): Forward {
       // what the human sees.
       // Modern Stop carries the exact chat identity. Prefer it over the
       // workspace-global SessionStart marker so concurrent chats cannot consume
-      // one another's post-create handoff receipt; retain the marker for legacy
-      // agentStop and broken modern channels.
+      // one another's post-create or post-switch handoff receipt; retain the
+      // marker for legacy agentStop and broken modern channels.
       return {
         hook: "aidlc-continue-workflow.ts",
         input: {
@@ -2820,7 +2838,8 @@ if (fwd.hook === "__audit_and_sensors__") {
     (fwd.input.tool_input as { file_path?: string } | undefined)?.file_path ?? "";
   if (
     filePath &&
-    Object.keys(ide.toolArgs ?? {}).length === 0
+    Object.keys(ide.toolArgs ?? {}).length === 0 &&
+    !ideStandsOutside(projectDir, resolvedPlanApprovalSessionId(ide))
   ) {
     let mediationFailure: string | null = null;
     try {

@@ -9,13 +9,15 @@
 //      the latest STAGE_STARTED slug from the audit tail instead. Payload-free.
 // In both cases the slug is reconciled into the state file via set-status.
 // Receives JSON on stdin from the adapter / Claude Code.
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import {
+  hookStandsOutside,
+  enterHookWorkflow,
   type ClaudeCodeHookInput,
   getField,
   hookDebug,
   hooksHealthDir,
+  writeHookStatusFile,
   isClaudeCodeHookInput,
   isoTimestamp,
   latestStartedStageSlug,
@@ -28,7 +30,24 @@ import {
 import { setStatus } from "../tools/aidlc-utility.ts";
 
 export async function run(input: string): Promise<number> {
-const projectDir = resolveProjectDirFromHook(import.meta.url);
+  const projectDir = resolveProjectDirFromHook(import.meta.url);
+  let payloadSession: unknown;
+  try {
+    payloadSession = (JSON.parse(input) as { session_id?: unknown }).session_id;
+  } catch {
+    // Missing/malformed payload: resolve without a payload session.
+  }
+  // A conversation that has not joined the selected workflow does not move its stage.
+  const workflow = enterHookWorkflow(projectDir, payloadSession);
+  try {
+    if (hookStandsOutside(workflow)) return 0;
+    return await syncStatus(input, projectDir);
+  } finally {
+    workflow.restore();
+  }
+}
+
+async function syncStatus(input: string, projectDir: string): Promise<number> {
 hookDebug(projectDir, "sync-workflow-state", "invoked");
 
 // Read JSON from stdin. Exit cleanly if stdin is a TTY — no Claude Code JSON
@@ -102,8 +121,7 @@ if (source === "ide-audit-sync") {
 
 // Health heartbeat
 const healthDir = hooksHealthDir(projectDir);
-mkdirSync(healthDir, { recursive: true });
-writeFileSync(join(healthDir, "sync-workflow-state.last"), isoTimestamp(), "utf-8");
+writeHookStatusFile(healthDir, "sync-workflow-state.last", isoTimestamp());
 
 // Update state through the shared implementation; the hook owns this mutation.
 hookDebug(projectDir, "sync-workflow-state", "set-status", { slug });

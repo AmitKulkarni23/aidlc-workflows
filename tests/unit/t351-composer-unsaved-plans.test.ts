@@ -1,6 +1,7 @@
 // covers: function:planChangesBetween, function:planWithChanges,
 // function:splitSlugList, function:composedPlanLabel,
-// function:firstPlannedStageOfPhase, function:customPlanBase, function:guardPolicyAtLeast,
+// function:firstPlannedStageOfPhase, function:customPlanBase, function:customPlanStart,
+// function:guardPolicyAtLeast,
 // function:saveComposedScope, function:writeCompiledGraphLocked,
 // function:delegatedLifecycleCommand,
 // subcommand:aidlc-graph:validate-grid, subcommand:aidlc-utility:intent-create,
@@ -24,7 +25,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { delegatedLifecycleCommand } from "../../core/hooks/aidlc-state-transition-guard.ts";
-import { customPlanBase, nearestStockScopes, scopeSettingsOf } from "../../core/tools/aidlc-graph.ts";
+import { customPlanBase, customPlanStart, nearestStockScopes, scopeSettingsOf } from "../../core/tools/aidlc-graph.ts";
 import {
   auditFilePath,
   composedPlanLabel,
@@ -429,36 +430,58 @@ describe("t351 (4) next carries the plan's typed changes and checks every echoed
     expect(existsSync("/tmp/t351-pwn")).toBe(false);
   });
 
-  test("a running workflow's stages change only through the reshape gate", () => {
-    const proj = createTestProject();
-    tempDirs.push(proj);
-    seedAidlcMemory(proj);
-    seedStateFile(proj, join(FIXTURES_DIR, "state-mid-ideation.md"));
+  test("a running workflow's named stage changes apply at once, with the undo named", () => {
+    const proj = installedProject();
+    expect(runTool(proj, "aidlc-utility.ts", ["intent-create", "--scope", "feature"]).status).toBe(0);
+    // The person named the stage: no compose gate re-asks it.
     const d = nextDirective(proj, ["--skip", "team-formation"]);
-    expect(d.kind).toBe("error");
-    expect(d.message).toContain("--skip and --add shape a new workflow's stages when it is created");
-    expect(d.message).toContain('compose "<the change>"');
+    expect(d.kind).toBe("print");
+    expect(d.message).not.toContain("next compose");
+    const command = /`([^`]*engine recompose [^`]*)`/.exec(d.message)?.[1] ?? "";
+    expect(command.endsWith("engine recompose --skip team-formation"), d.message).toBe(true);
+    expect(d.message).toContain('"Skipped team-formation. To undo it, type `/aidlc --add team-formation`."');
+    const words = command.split(" ");
+    const applied = runTool(proj, "aidlc.ts", words.slice(words.indexOf("engine")));
+    expect(applied.status, applied.out).toBe(0);
+    expect(applied.out).toContain("1 skipped (team-formation)");
+    expect(stateOf(proj)).toContain("- [ ] team-formation \u2014 SKIP");
+    // Asking again changes nothing, so nothing is sent and no undo is named.
+    const again = nextDirective(proj, ["--skip", "team-formation"]);
+    expect(again.kind).toBe("print");
+    expect(again.message).not.toContain("engine recompose");
+    expect(again.message).toContain('"Team-formation is already skipped. The plan is unchanged."');
+
+    // A setting typed with it runs first, so neither request is dropped.
+    const both = nextDirective(proj, ["--add", "team-formation", "--depth", "minimal"]);
+    expect(both.kind).toBe("print");
+    const setting = both.message.indexOf("config set depth minimal");
+    expect(setting, both.message).toBeGreaterThan(-1);
+    expect(setting).toBeLessThan(both.message.indexOf("engine recompose --add team-formation"));
+    expect(both.message).toContain("To undo it, type `/aidlc --skip team-formation`.");
+
     const combined = nextDirective(proj, ["compose", "--skip", "team-formation", "trim it"]);
     expect(combined.kind).toBe("error");
     expect(combined.message).toContain("Cannot combine --skip or --add");
+    expect(combined.message).not.toContain("at creation");
   });
 });
 
 describe("t351 (5) scope save keeps a work's plan as a reusable scope", () => {
   test("the saved scope is the running plan, with its settings, and resolves at once", () => {
     const proj = installedProject();
-    expect(createComposed(proj, ["--learnings", "off", "--review", "none", "--depth", "standard"]).status).toBe(0);
+    // bugfix asks no learnings question; this work turns it on, and the saved scope keeps that.
+    expect(createComposed(proj, ["--learnings", "on", "--review", "none", "--depth", "standard"]).status).toBe(0);
     expect(stateOf(proj)).toContain("- **Depth**: Standard");
     const stateBefore = stateOf(proj);
     const saved = runTool(proj, "aidlc-utility.ts", ["scope-save", "--name", "quick-fix", "--keywords", "parser-fix"]);
     expect(saved.status, saved.out).toBe(0);
     expect(saved.out).toContain("Saved as scope quick-fix (");
-    expect(saved.out).toContain("sensors on, learnings off, summary confirmation on, reviews none).");
+    expect(saved.out).toContain("sensors on, learnings on, summary confirmation off, reviews none).");
     expect(saved.out).toContain('Next time: /aidlc --scope quick-fix "<what to build>"');
     // The running work is left as it is.
     expect(stateOf(proj)).toBe(stateBefore);
     const record = readFileSync(join(proj, "aidlc", "scopes", "quick-fix.md"), "utf-8");
-    for (const line of ["name: quick-fix", "depth: Standard", "guard_policy: off", "learnings: off", "review_cap: none", "  - parser-fix"]) {
+    for (const line of ["name: quick-fix", "depth: Standard", "guard_policy: off", "learnings: on", "summary_confirmation: off", "review_cap: none", "  - parser-fix"]) {
       expect(record, line).toContain(line);
     }
     expect(scopeFiles(proj)).toContain("aidlc-quick-fix.md");
@@ -654,5 +677,158 @@ describe("t351 (7) every conductor surface offers the save and never writes scop
     expect(d.message).toContain("Approve / Approve and save as scope / Edit the plan / Reject");
     expect(d.message).toContain("scope save --name <name>");
     expect(d.message).toContain("create it with --scope <baseScope> plus --skip <changes.skip> and --add <changes.add>");
+  });
+});
+
+describe("t351 (8) a custom plan starts from classic's ceremony, whatever stock scope it runs on", () => {
+  // Issue #1552: a custom plan near bugfix showed bugfix's summary
+  // confirmation on. It picks its own stages but starts from the ceremony a
+  // person gets without composing.
+  const CLASSIC = {
+    guard_policy: "off",
+    scope_settings: { sensors: "on", learnings: "on", summary_confirmation: "off", plan_approval: "on", review_cap: "advisory" },
+  } as const;
+  const read = (surface: string) => readFileSync(join(REPO_ROOT, surface), "utf-8").replace(/\s+/g, " ");
+
+  function validate(proj: string, proposal: unknown, route: string[]) {
+    const path = join(proj, "proposal.json");
+    writeFileSync(path, JSON.stringify(proposal));
+    const run = spawnSync(BUN, [GRAPH_TOOL, "validate-grid", "--proposal", path, ...route, "--project-dir", proj], {
+      encoding: "utf-8",
+      env: { ...process.env, CLAUDE_PROJECT_DIR: proj },
+    });
+    return { status: run.status, out: run.stdout + run.stderr, body: JSON.parse(run.stdout) as Record<string, unknown> };
+  }
+
+  test("customPlanStart is classic's Guard Policy and settings, and nothing when classic is not enabled", () => {
+    withEnvAndFreshCaches(POLICY_ENV, () => {
+      expect(customPlanStart()).toEqual(CLASSIC);
+      expect(customPlanStart()).toEqual({ guard_policy: scopeGuardPolicyDefault("classic"), scope_settings: scopeSettingsOf("classic")! });
+    });
+    const proj = createTestProject();
+    tempDirs.push(proj);
+    const scopes = join(proj, "scopes");
+    cpSync(join(REPO_ROOT, "core", "scopes"), scopes, { recursive: true });
+    rmSync(join(scopes, "aidlc-classic.md"));
+    withEnvAndFreshCaches({ ...POLICY_ENV, AIDLC_SCOPES_DIR: scopes }, () => {
+      expect(customPlanStart()).toBeNull();
+    });
+  });
+
+  test("validate-grid echoes custom_start on every run but --matched", () => {
+    const proj = createTestProject();
+    tempDirs.push(proj);
+    seedAidlcMemory(proj);
+    const plan = { stages: composedGrid(), scopeSettings: CLASSIC.scope_settings, guardPolicy: CLASSIC.guard_policy, depth: "Standard" };
+    const unrouted = validate(proj, { stages: composedGrid() }, []);
+    expect(unrouted.status, unrouted.out).toBe(0);
+    expect(unrouted.body.custom_start).toEqual(CLASSIC);
+    const custom = validate(proj, plan, ["--custom"]);
+    expect(custom.status, custom.out).toBe(0);
+    expect(custom.body.custom_start).toEqual(CLASSIC);
+    const matched = validate(proj, { ...plan, stages: stockGrid("bugfix") }, ["--matched", "bugfix"]);
+    expect(matched.status, matched.out).toBe(0);
+    expect(matched.body).not.toHaveProperty("custom_start");
+  });
+
+  test("on a bugfix base, classic's ceremony becomes this work's settings at creation, with no typed switch", () => {
+    const proj = createTestProject();
+    tempDirs.push(proj);
+    seedAidlcMemory(proj);
+    // Three stages past bugfix: too far to match, so the plan runs on bugfix.
+    const nearBugfix = { ...stockGrid("bugfix"), "user-stories": "EXECUTE", "units-generation": "EXECUTE", "feedback-optimization": "EXECUTE" };
+    const plan = { stages: nearBugfix, scopeSettings: CLASSIC.scope_settings, guardPolicy: CLASSIC.guard_policy, depth: "Standard" };
+    const validated = validate(proj, plan, ["--custom"]);
+    expect(validated.status, validated.out).toBe(0);
+    expect(validated.body).toMatchObject({ routing: "custom", base_scope: "bugfix" });
+    // bugfix asks no learnings question; classic does, so the plan turns it back on.
+    expect(validated.body.creation_settings).toEqual({ learnings: "on" });
+    // What the conductor runs on approval: no --guard-policy for off, one flag per creation setting.
+    const changes = validated.body.plan_changes as { skip: string[]; add: string[] };
+    const args = ["intent-create", "--scope", "bugfix", "--learnings", "on", "--arguments", "x", "--label", "classic-ceremony"];
+    if (typeof validated.body.creation_depth === "string") args.push("--depth", validated.body.creation_depth);
+    if (changes.skip.length > 0) args.push("--skip", changes.skip.join(","));
+    if (changes.add.length > 0) args.push("--add", changes.add.join(","));
+    const created = spawnSync(BUN, [UTIL, ...args, "--project-dir", proj], {
+      encoding: "utf-8",
+      env: { ...process.env, CLAUDE_PROJECT_DIR: proj, AIDLC_SKIP_HUMAN_PRESENCE_GUARD: "0", AIDLC_UNATTENDED: "0" },
+    });
+    expect(created.status, created.stdout + created.stderr).toBe(0);
+    const state = stateOf(proj);
+    expect(state).toMatch(/^- \*\*Learnings\*\*: on\b/m);
+    expect(state).toMatch(/^- \*\*Summary Confirmation\*\*: off\b/m);
+    expect(state).toMatch(/^- \*\*Guard Policy\*\*: off\b/m);
+    expect(state).toMatch(/^- \*\*Plan Approval\*\*: on\b/m);
+  });
+
+  test("on an express base, the plan approval the gate showed reaches the new work", () => {
+    // express builds code plans without asking; classic asks. The gate shows
+    // on, so creation must carry --plan-approval on, not inherit express's off.
+    const proj = createTestProject();
+    tempDirs.push(proj);
+    seedAidlcMemory(proj);
+    const nearExpress = { ...stockGrid("express"), "user-stories": "EXECUTE", "units-generation": "EXECUTE", "feedback-optimization": "EXECUTE" };
+    const plan = { stages: nearExpress, scopeSettings: CLASSIC.scope_settings, guardPolicy: CLASSIC.guard_policy, depth: "Minimal" };
+    const validated = validate(proj, plan, ["--custom"]);
+    expect(validated.status, validated.out).toBe(0);
+    expect(validated.body).toMatchObject({ routing: "custom", base_scope: "express" });
+    expect(validated.body.creation_settings).toEqual({ sensors: "on", learnings: "on", plan_approval: "on", review: "advisory" });
+    // The conductor turns each creation setting into its fixed flag.
+    const flags: Record<string, string> = {
+      sensors: "--sensors", learnings: "--learnings", summary_confirmation: "--summary-confirmation", plan_approval: "--plan-approval", review: "--review",
+    };
+    const args = ["intent-create", "--scope", "express", "--arguments", "x", "--label", "express-plan"];
+    for (const [key, value] of Object.entries(validated.body.creation_settings as Record<string, string>)) args.push(flags[key], value);
+    const changes = validated.body.plan_changes as { skip: string[]; add: string[] };
+    if (changes.skip.length > 0) args.push("--skip", changes.skip.join(","));
+    if (changes.add.length > 0) args.push("--add", changes.add.join(","));
+    const created = spawnSync(BUN, [UTIL, ...args, "--project-dir", proj], {
+      encoding: "utf-8",
+      env: { ...process.env, CLAUDE_PROJECT_DIR: proj, AIDLC_SKIP_HUMAN_PRESENCE_GUARD: "0", AIDLC_UNATTENDED: "0" },
+    });
+    expect(created.status, created.stdout + created.stderr).toBe(0);
+    const state = stateOf(proj);
+    expect(state).toMatch(/^- \*\*Plan Approval\*\*: on\b/m);
+    expect(state).toMatch(/^- \*\*Sensors\*\*: on\b/m);
+    expect(state).toMatch(/^- \*\*Summary Confirmation\*\*: off\b/m);
+  });
+
+  test("every conductor passes a plan_approval creation setting, and no flag only for the person's skip", () => {
+    for (const harness of ["claude", "codex", "copilot", "cursor", "kiro", "kiro-ide", "opencode"]) {
+      const surface = `harness/${harness}/skills/aidlc/SKILL.md`;
+      const text = read(surface);
+      expect(text, surface).toContain("a `plan_approval` in `creationSettings` (a custom plan raising it on a base that builds without asking) becomes `--plan-approval` like the other settings");
+      expect(text, surface).toContain("so keep the proposal as it is and pass no `--plan-approval` flag.");
+      expect(text, surface).not.toContain("Plan approval keeps the value of the scope the plan runs on");
+    }
+    const dispatch = read("core/tools/aidlc-orchestrate.ts");
+    expect(dispatch).toContain("a plan_approval in creationSettings becomes --plan-approval like the others");
+    expect(dispatch).toContain("so pass no --plan-approval flag at all");
+    expect(dispatch).not.toContain("plan approval keeps the scope's value");
+    // The validate-grid references name all five settings.
+    for (const surface of ["docs/guide/12-cli-commands.md", "docs/reference/03-orchestrator.md"]) {
+      expect(read(surface), surface).not.toMatch(/four (scope settings|`scopeSettings`)/);
+      expect(read(surface), surface).toContain("`plan_approval`");
+    }
+  });
+
+  test("the composer starts a custom plan from custom_start and keeps its Guard Policy off", () => {
+    for (const surface of ["core/agents/aidlc-composer-agent.md", "core/knowledge/aidlc-composer-agent/composing.md"]) {
+      const text = read(surface);
+      expect(text, surface).toContain("`custom_start.guard_policy`");
+      expect(text, surface).toContain("`custom_start.scope_settings`");
+      // An edit that turns a matched plan custom keeps what the gate showed.
+      expect(text, surface).toContain("A matched proposal that the human's edit turns custom keeps the Guard Policy and settings the gate showed");
+      // The retired rules: settings from the nearest stock scope, and a Guard Policy chosen from risk.
+      expect(text, surface).not.toContain("reads the same file as its settings baseline");
+      expect(text, surface).not.toContain("For a custom grid, start from the validator's nearest stock scope.");
+      expect(text, surface).not.toMatch(/relaxed for a spike|points to relaxed|propose the value from the evidence/);
+      expect(text, surface).not.toContain("or a custom plan's base scope");
+    }
+    // The evidence rules live in the knowledge file the agent defers to.
+    expect(read("core/knowledge/aidlc-composer-agent/composing.md")).toContain("a custom plan turns it on only when either is HIGH");
+    const dispatch = read("core/tools/aidlc-orchestrate.ts");
+    expect(dispatch).toContain("a custom one starts from the classic scope's default, which the validator echoes as custom_start");
+    expect(dispatch).not.toContain("a custom one the composer's choice");
   });
 });
